@@ -5,7 +5,7 @@ on:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,8 +17,12 @@ jobs:
         run: ruff check .
       - name: Test
         run: pytest -q
+      - name: Check migrations
+        run: |
+          alembic upgrade head
+          alembic check
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Build image

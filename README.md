@@ -1,57 +1,70 @@
 # Enterprise AI Workflow Agent (OpsPilot)
 
-A portfolio project demonstrating reliable, approval-gated enterprise AI workflows.
+A portfolio project demonstrating enterprise AI workflows over fictional SaaS data.
 
-## Milestone 2: Data layer
+## Milestone 3: Read-only MCP tools and knowledge search
 
-Python 3.11+, FastAPI, SQLAlchemy 2.0, Alembic, SQLite locally; PostgreSQL-compatible models.
-The database contains fictional B2B SaaS customers and documentation. No proprietary data.
+Stack: FastAPI, SQLAlchemy 2.0, Alembic, SQLite (PostgreSQL-ready), official Python MCP SDK.
 
-### Setup (Windows PowerShell)
+### Windows PowerShell setup
+
+From the repository root, with an existing `.venv`:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-Copy-Item .env.example .env
-alembic upgrade head
-python -m enterprise_ai_workflow_agent.db.seed
-python -m uvicorn enterprise_ai_workflow_agent.main:app --reload
+.venv\Scripts\python.exe -m pip install --no-cache-dir -e ".[dev]"
+.venv\Scripts\python.exe -m alembic upgrade head
+.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.db.seed
+.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m ruff check .
+.venv\Scripts\python.exe -m alembic check
+.venv\Scripts\python.exe scripts\smoke_mcp.py
+```
+
+Run FastAPI separately:
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn enterprise_ai_workflow_agent.main:app --reload
 ```
 
 Swagger: http://127.0.0.1:8000/docs
 
-### API endpoints
+### MCP server
 
-- `GET /api/v1/health`
-- `GET /api/v1/accounts`
-- `GET /api/v1/accounts/{account_id}`
-- `GET /api/v1/accounts/{account_id}/contacts`
-- `GET /api/v1/products`
-- `GET /api/v1/tickets?account_id=1`
-- `GET /api/v1/tickets/{ticket_id}`
-- `GET /api/v1/knowledge?product_id=1`
-
-### Tests
+Run as a stdio MCP server:
 
 ```powershell
-pytest -q
-ruff check .
-alembic check
+.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.mcp_server.server
 ```
 
-### Database migration
+This command waits for JSON-RPC messages from an MCP client; it is **not** an HTTP server.
+Do not type messages into it or expect a URL. Use `scripts/smoke_mcp.py` for an end-to-end
+client/server smoke test.
 
-Use `alembic upgrade head` after pulling schema changes. To create a new migration:
+Registered tools:
+- `search_accounts(query, limit=10)`
+- `get_account_tickets(account_id, limit=10)`
+- `get_ticket_details(ticket_id)`
+- `get_product_information(product_id)`
+- `search_knowledge(query, product_id=None, limit=5)`
 
-```powershell
-alembic revision --autogenerate -m "describe change"
-```
+### Knowledge search limitations
 
-### Architecture notes
+Knowledge search is deterministic, case-insensitive token-overlap ranking with title
+boosting. It is **not** semantic retrieval, embeddings, pgvector, or RAG. Documents
+are returned with snippets and source metadata. Later milestones can add vector search.
 
-- Routes use injected SQLAlchemy sessions; no raw SQL generated from user input.
-- Migration scripts, not `create_all`, own the database schema.
-- Read-only API; write operations and approval/audit controls will come later.
-- The synthetic seed script skips insertion when accounts already exist.
-- Authentication, authorization and tenant isolation are not yet implemented; do not expose this API publicly.
+### Safety boundaries
+
+All tools are read-only. Tool parameters use SQLAlchemy bound expressions, not raw SQL.
+There is no authentication, authorization, tenant isolation, or approval/audit layer yet.
+**Use synthetic data only; do not deploy publicly.** Tool responses can contain untrusted
+document content, so a future LLM agent must not treat retrieved text as instructions.
+
+### CI
+
+The existing `.github/workflows/ci.yml` runs Ruff, pytest (including MCP registration and
+service tests), Alembic migration checks, and Docker image build on every push/PR.
+
+### Database schema
+
+Milestone 3 does not change the database schema; Alembic stays at revision `0001`.

@@ -1,45 +1,57 @@
-# Enterprise AI Workflow Agent
+# Enterprise AI Workflow Agent (OpsPilot)
 
-A portfolio project for evidence-backed, approval-gated enterprise AI workflows.
+A portfolio project demonstrating reliable, approval-gated enterprise AI workflows.
 
-> Status: Milestone 1 — FastAPI foundation. LLM orchestration, MCP tools, business data, and approvals are planned but not implemented yet.
+## Milestone 2: Data layer
 
-## Local development
+Python 3.11+, FastAPI, SQLAlchemy 2.0, Alembic, SQLite locally; PostgreSQL-compatible models.
+The database contains fictional B2B SaaS customers and documentation. No proprietary data.
 
-Requires Python 3.11+.
+### Setup (Windows PowerShell)
 
 ```powershell
-py -3.12 -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
-uvicorn enterprise_ai_workflow_agent.main:app --reload
+Copy-Item .env.example .env
+alembic upgrade head
+python -m enterprise_ai_workflow_agent.db.seed
+python -m uvicorn enterprise_ai_workflow_agent.main:app --reload
 ```
 
-Open http://127.0.0.1:8000/docs or visit http://127.0.0.1:8000/api/v1/health.
+Swagger: http://127.0.0.1:8000/docs
 
-## Quality checks
+### API endpoints
+
+- `GET /api/v1/health`
+- `GET /api/v1/accounts`
+- `GET /api/v1/accounts/{account_id}`
+- `GET /api/v1/accounts/{account_id}/contacts`
+- `GET /api/v1/products`
+- `GET /api/v1/tickets?account_id=1`
+- `GET /api/v1/tickets/{ticket_id}`
+- `GET /api/v1/knowledge?product_id=1`
+
+### Tests
 
 ```powershell
-ruff check .
 pytest -q
+ruff check .
+alembic check
 ```
 
-## Docker
+### Database migration
+
+Use `alembic upgrade head` after pulling schema changes. To create a new migration:
 
 ```powershell
-docker build -t enterprise-ai-workflow-agent .
-docker run --rm -p 8000:8000 enterprise-ai-workflow-agent
+alembic revision --autogenerate -m "describe change"
 ```
 
-## Roadmap
+### Architecture notes
 
-- [x] API foundation, tests, linting, Docker, CI
-- [ ] Synthetic enterprise data and PostgreSQL
-- [ ] MCP tools and document retrieval
-- [ ] LLM orchestration and workflow state
-- [ ] Human approval and audit trail
-- [ ] Frontend and agent evaluation
-
-## Security
-
-Use only synthetic/public data. Never commit `.env` or API credentials. No autonomous write actions are implemented in this milestone.
+- Routes use injected SQLAlchemy sessions; no raw SQL generated from user input.
+- Migration scripts, not `create_all`, own the database schema.
+- Read-only API; write operations and approval/audit controls will come later.
+- The synthetic seed script skips insertion when accounts already exist.
+- Authentication, authorization and tenant isolation are not yet implemented; do not expose this API publicly.

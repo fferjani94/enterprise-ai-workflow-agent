@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="OpsPilot: evidence-grounded AI investigations over MCP-connected support data.">
+  <title>OpsPilot - Support Investigation Workspace</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">O</span>
+        <div class="brand-text">
+          <strong>OpsPilot</strong>
+          <span>Support investigations</span>
+        </div>
+      </div>
+
+      <nav aria-label="Primary">
+        <ul class="nav">
+          <li><a href="#workspace" data-view="workspace" aria-current="page">Investigate</a></li>
+          <li><a href="#how-it-works" data-view="how-it-works">How it works</a></li>
+          <li><a href="/docs">API reference</a></li>
+        </ul>
+      </nav>
+
+      <section class="runtime" aria-labelledby="runtime-title">
+        <h2 id="runtime-title">Runtime</h2>
+        <dl>
+          <div><dt>Server</dt><dd id="rt-status">Checking...</dd></div>
+          <div><dt>Model</dt><dd id="rt-model">-</dd></div>
+          <div><dt>Max tool rounds</dt><dd id="rt-rounds">-</dd></div>
+          <div><dt>Timeout</dt><dd id="rt-timeout">-</dd></div>
+        </dl>
+      </section>
+
+      <p class="sidebar-foot">Synthetic data. Read-only tools. Local model.</p>
+    </aside>
+
+    <main id="main" tabindex="-1">
+      <noscript><p class="banner banner-error">OpsPilot needs JavaScript enabled to run investigations.</p></noscript>
+
+      <section id="view-workspace" class="view" aria-labelledby="page-title">
+        <header class="page-header">
+          <div>
+            <h1 id="page-title">Investigation workspace</h1>
+            <p class="lede">
+              Ask about customers, support tickets, and product documentation. The agent retrieves
+              records through read-only MCP tools, and every answer is shown with the evidence behind it.
+            </p>
+          </div>
+          <span class="badge badge-model" id="model-badge">Model: loading...</span>
+        </header>
+
+        <form id="investigation-form" class="panel" novalidate>
+          <label class="field-label" for="question">Investigation question</label>
+          <textarea id="question" name="question" rows="4" maxlength="4000"
+                    placeholder="e.g. Investigate the SSO login failures affecting Northstar Labs."
+                    aria-describedby="question-error char-count"></textarea>
+          <div class="field-meta">
+            <p id="question-error" class="field-error" role="alert"></p>
+            <span id="char-count" class="muted small">0 / 4000</span>
+          </div>
+
+          <fieldset class="examples">
+            <legend>Try an example</legend>
+            <div class="chips">
+              <button type="button" class="chip"
+                      data-prompt="Investigate the SSO login issues affecting Northstar Labs. Check their support tickets and the documentation, and cite the evidence.">
+                SSO login failures at Northstar Labs
+              </button>
+              <button type="button" class="chip"
+                      data-prompt="Why is the Northstar Labs dashboard loading slowly? Check their tickets and the knowledge base.">
+                Slow dashboard at Northstar Labs
+              </button>
+              <button type="button" class="chip"
+                      data-prompt="Bluebird Commerce reports duplicate webhook events. Find their ticket and any documentation about webhook retries.">
+                Webhook retries at Bluebird Commerce
+              </button>
+              <button type="button" class="chip"
+                      data-prompt="List all open support tickets for Northstar Labs and Bluebird Commerce, with their priority.">
+                Open tickets across both accounts
+              </button>
+            </div>
+          </fieldset>
+
+          <div class="actions">
+            <div class="option">
+              <label for="max-rounds">Tool rounds</label>
+              <select id="max-rounds" name="max_rounds"></select>
+            </div>
+            <div class="buttons">
+              <button type="button" id="stop-btn" class="btn btn-secondary" hidden>Stop waiting</button>
+              <button type="submit" id="submit-btn" class="btn btn-primary">Investigate</button>
+            </div>
+          </div>
+          <p id="stop-hint" class="hint" hidden>
+            "Stop waiting" cancels the request. The server then stops the investigation and
+            frees its slot for the next one.
+          </p>
+        </form>
+
+        <p id="status-announcer" class="sr-only" role="status" aria-live="polite"></p>
+
+        <section id="results" class="results" aria-labelledby="results-title">
+          <h2 id="results-title" tabindex="-1">Results</h2>
+
+          <div id="state-empty" class="empty">
+            <p class="empty-title">No investigation yet</p>
+            <p class="muted">
+              Pick an example or write your own question. Results will show the answer, the verified
+              evidence records, and the full tool execution timeline.
+            </p>
+          </div>
+
+          <div id="state-loading" class="loading" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <div>
+              <p class="loading-title">Investigating... <span id="elapsed" class="mono">0s</span></p>
+              <p class="muted small" id="loading-detail"></p>
+            </div>
+          </div>
+
+          <div id="state-notice" class="banner banner-info" hidden>
+            <p class="banner-title">Stopped waiting</p>
+            <p>
+              The request was cancelled. The server stops the investigation as soon as it
+              notices the closed connection (within about a second), so a new investigation
+              does not have to wait for it. Your question has been kept.
+            </p>
+          </div>
+
+          <div id="state-error" class="banner banner-error" role="alert" hidden>
+            <p class="banner-title" id="error-title"></p>
+            <p id="error-message"></p>
+            <ul id="error-details" class="error-details" hidden></ul>
+            <p class="small muted" id="error-ref" hidden></p>
+            <p class="small">Your question has been kept. Adjust it or try again.</p>
+          </div>
+
+          <div id="state-result" hidden>
+            <div class="result-head">
+              <div>
+                <h3 class="result-title">Investigation result</h3>
+                <p class="muted result-question" id="result-question"></p>
+              </div>
+              <span class="status" id="result-status"></span>
+            </div>
+
+            <div id="limited-banner" class="banner banner-warning" hidden>
+              <p class="banner-title" id="limited-title">Investigation incomplete</p>
+              <p id="limited-text">
+                The agent did not retrieve all the evidence this question needs, so there is no
+                complete conclusion. The evidence and timeline below show what was retrieved. Try a
+                narrower question or allow more tool rounds.
+              </p>
+            </div>
+
+            <dl class="metrics">
+              <div><dt>Duration</dt><dd id="m-duration">-</dd></div>
+              <div><dt>Tool rounds</dt><dd id="m-rounds">-</dd></div>
+              <div><dt>Tool calls</dt><dd id="m-calls">-</dd></div>
+              <div><dt>Evidence records</dt><dd id="m-evidence">-</dd></div>
+            </dl>
+
+            <section class="panel" aria-labelledby="answer-title">
+              <h3 id="answer-title" class="panel-title">Answer</h3>
+              <p class="muted small" id="answer-source">
+                Written by the local model. Check it against the findings and records below.
+              </p>
+              <div id="answer-notice" class="banner banner-warning" hidden>
+                <p class="banner-title">Evidence summary only</p>
+                <p id="answer-notice-text"></p>
+              </div>
+              <div id="answer" class="answer"></div>
+            </section>
+
+            <section class="panel" aria-labelledby="analysis-title">
+              <h3 id="analysis-title" class="panel-title">What the evidence supports</h3>
+              <p class="muted small">
+                Generated by rules from the retrieved records, not by the model. Record lists
+                and counts come only from here; the answer above is the model's explanation.
+              </p>
+              <div id="analysis" class="analysis"></div>
+            </section>
+
+            <section class="panel" aria-labelledby="evidence-title">
+              <div class="panel-head">
+                <h3 id="evidence-title" class="panel-title">Retrieved records</h3>
+                <span class="count" id="evidence-count"></span>
+              </div>
+              <p class="muted small">
+                Records returned by tool calls during this investigation, shown as retrieved and
+                labelled for relevance to the question. Nothing in this section is written by
+                the model.
+              </p>
+              <div id="evidence"></div>
+            </section>
+
+            <details class="panel timeline-panel" id="timeline-panel">
+              <summary>
+                <span class="panel-title">Tool execution timeline</span>
+                <span class="count" id="timeline-count"></span>
+              </summary>
+              <div class="timeline-body">
+                <p class="muted small">Tool calls in the order the agent made them.</p>
+                <button type="button" id="toggle-steps" class="btn btn-link">Expand all steps</button>
+                <ol id="timeline" class="timeline"></ol>
+              </div>
+            </details>
+
+            <div class="result-foot">
+              <span class="muted small">Investigation ID <code id="result-id"></code></span>
+              <button type="button" id="new-btn" class="btn btn-secondary">New investigation</button>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="view-how-it-works" class="view" aria-labelledby="how-title" hidden>
+        <header class="page-header">
+          <div>
+            <h1 id="how-title">How OpsPilot works</h1>
+            <p class="lede">
+              A bounded agent loop over read-only business tools, with safeguards that keep answers
+              tied to retrieved records.
+            </p>
+          </div>
+        </header>
+
+        <ol class="pipeline">
+          <li class="panel">
+            <span class="step-badge">1</span>
+            <h2>Question</h2>
+            <p>You describe a customer problem in plain language.</p>
+          </li>
+          <li class="panel">
+            <span class="step-badge">2</span>
+            <h2>Agent</h2>
+            <p>A LangGraph loop asks a local Ollama model which tool to call, up to a fixed number of rounds.</p>
+          </li>
+          <li class="panel">
+            <span class="step-badge">3</span>
+            <h2>MCP tools</h2>
+            <p>Five read-only tools query accounts, tickets, products, and knowledge documents.</p>
+          </li>
+          <li class="panel">
+            <span class="step-badge">4</span>
+            <h2>Verified answer</h2>
+            <p>The answer is returned with the retrieved records and the full tool trace.</p>
+          </li>
+        </ol>
+
+        <section class="panel" aria-labelledby="safeguards-title">
+          <h2 id="safeguards-title" class="panel-title">Safeguards</h2>
+          <ul class="plain-list">
+            <li>Tools are read-only. The agent cannot change any data.</li>
+            <li>Record IDs must come from an earlier tool result. Unverified IDs are rejected and logged in the timeline.</li>
+            <li>If an answer cites an ID that no tool returned, it is replaced by the retrieved records.</li>
+            <li>Tool rounds, calls per round, result size, and total run time are all capped.</li>
+            <li>Evidence is checked by rules, not by a model. It reduces unsupported claims but does not guarantee correctness, so review the evidence yourself.</li>
+          </ul>
+        </section>
+
+        <section class="panel" aria-labelledby="tools-title">
+          <h2 id="tools-title" class="panel-title">Available tools</h2>
+          <ul class="plain-list mono-list">
+            <li><code>search_accounts</code> find customer accounts by name</li>
+            <li><code>get_account_tickets</code> list support tickets for an account</li>
+            <li><code>get_ticket_details</code> read a single ticket</li>
+            <li><code>get_product_information</code> read product version and description</li>
+            <li><code>search_knowledge</code> search product documentation</li>
+          </ul>
+          <p class="muted small">
+            The demo database contains synthetic data only: Northstar Labs and Bluebird Commerce
+            as customers, and the CloudDesk and FlowSync products.
+          </p>
+        </section>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

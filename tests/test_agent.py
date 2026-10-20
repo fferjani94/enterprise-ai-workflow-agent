@@ -17,6 +17,8 @@ class FakeBoundModel:
 
 
 class FakeModel:
+    synthesis = None  # reply of the tool-less synthesis call; None makes it fail
+
     def __init__(self, replies):
         self.replies = replies
         self.bound = None
@@ -24,6 +26,11 @@ class FakeModel:
     def bind_tools(self, tools):
         self.bound = tools
         return FakeBoundModel(self.replies)
+
+    async def ainvoke(self, messages):
+        if self.synthesis is None:
+            raise RuntimeError("no synthesis reply scripted")
+        return AIMessage(content=self.synthesis)
 
 
 class FakeMCP:
@@ -50,11 +57,13 @@ def test_tool_call_and_grounded_answer():
                                            "args": {"query": "Northstar"}, "id": "call1"}]),
         AIMessage(content="Northstar Labs is account 1 (search_accounts result)."),
     ])
+    model.synthesis = "Northstar Labs is account 1."
     client = FakeMCP()
     result = asyncio.run(investigate("Find Northstar Labs", model, client, TOOLS))
     assert result["tool_rounds"] == 1
     assert result["tool_trace"][0]["success"] is True
     assert client.calls == [("search_accounts", {"query": "Northstar"})]
+    assert result["answer_source"] == "synthesis"
     assert "account 1" in result["answer"]
     assert model.bound[0]["function"]["name"] == "search_accounts"
 

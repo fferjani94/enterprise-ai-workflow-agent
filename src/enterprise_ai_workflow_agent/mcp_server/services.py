@@ -18,7 +18,7 @@ STOPWORDS = {"a", "an", "and", "are", "for", "how", "in", "is", "of",
 
 def _limit(limit: int) -> int:
     if not 1 <= limit <= MAX_RESULTS:
-        raise ValueError("limit must be between 1 and 20")
+        raise ValueError(f"limit must be between 1 and {MAX_RESULTS}")
     return limit
 
 

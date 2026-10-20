@@ -1,17 +1,20 @@
-# Enterprise AI Workflow Agent (OpsPilot)
+# OpsPilot — Enterprise AI Workflow Agent
 
-A portfolio project demonstrating enterprise AI workflows over fictional SaaS data.
+Fictional SaaS customer support investigation agent, using FastAPI, SQLite/SQLAlchemy,
+Alembic, MCP, LangGraph, optional local Ollama inference, and a dependency-free web
+dashboard.
 
-## Milestone 3: Read-only MCP tools and knowledge search
+**Status:** Milestone 5 complete (version 0.5.0). The dashboard, investigation API, CLI and
+MCP tools work end to end **on a local machine** with a local Ollama model and the seeded
+SQLite database. The project is **not production-ready**: see
+[Production deployment limitations](#production-deployment-limitations).
 
-Stack: FastAPI, SQLAlchemy 2.0, Alembic, SQLite (PostgreSQL-ready), official Python MCP SDK.
+## Run locally on Windows (PowerShell)
 
-### Windows PowerShell setup
-
-From the repository root, with an existing `.venv`:
+From the repository root:
 
 ```powershell
-.venv\Scripts\python.exe -m pip install --no-cache-dir -e ".[dev]"
+.venv\Scripts\python.exe -m pip install --no-cache-dir -e ".[dev,agent]"
 .venv\Scripts\python.exe -m alembic upgrade head
 .venv\Scripts\python.exe -m enterprise_ai_workflow_agent.db.seed
 .venv\Scripts\python.exe -m pytest -q
@@ -20,51 +23,235 @@ From the repository root, with an existing `.venv`:
 .venv\Scripts\python.exe scripts\smoke_mcp.py
 ```
 
-Run FastAPI separately:
+Install Ollama separately from https://ollama.com/download and pull a model:
 
 ```powershell
-.venv\Scripts\python.exe -m uvicorn enterprise_ai_workflow_agent.main:app --reload
+ollama pull qwen2.5:3b
+ollama list
 ```
 
-Swagger: http://127.0.0.1:8000/docs
+Start the Ollama service if it is not already running (`ollama serve` in a separate terminal).
 
-### MCP server
+### Dashboard
 
-Run as a stdio MCP server:
+Start the server **from the repository root** (the default `DATABASE_URL`,
+`sqlite:///./opspilot.db`, is relative to the working directory, and the MCP tool server
+inherits it):
 
 ```powershell
-.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.mcp_server.server
+.venv\Scripts\python.exe -m uvicorn enterprise_ai_workflow_agent.main:app --host 127.0.0.1 --port 8000
 ```
 
-This command waits for JSON-RPC messages from an MCP client; it is **not** an HTTP server.
-Do not type messages into it or expect a URL. Use `scripts/smoke_mcp.py` for an end-to-end
-client/server smoke test.
+Open http://127.0.0.1:8000/. Pick an example or type a question, choose the number of tool
+rounds and select **Investigate** (or press Ctrl+Enter). The result shows:
 
-Registered tools:
-- `search_accounts(query, limit=10)`
-- `get_account_tickets(account_id, limit=10)`
-- `get_ticket_details(ticket_id)`
-- `get_product_information(product_id)`
-- `search_knowledge(query, product_id=None, limit=5)`
+- **Answer**: a short narrative and where it came from (model, tool-less synthesis, or a
+  deterministic evidence summary), with a warning banner for limited investigations.
+- **What the evidence supports**: rule-generated sections (relevant tickets, relevant
+  documents, other records, unknowns). Record lists and counts come only from here.
+- **Retrieved records**: every record returned by the tools, with its relevance label.
+- **Tool execution timeline**: each call with its arguments, adjustments, errors, and
+  calls added by the orchestrator.
 
-### Knowledge search limitations
+**Stop waiting** cancels the request. The server notices the closed connection within about
+a second and cancels the investigation, which shuts down its MCP subprocess and frees the
+concurrency slot. API docs are at http://127.0.0.1:8000/docs.
 
-Knowledge search is deterministic, case-insensitive token-overlap ranking with title
-boosting. It is **not** semantic retrieval, embeddings, pgvector, or RAG. Documents
-are returned with snippets and source metadata. Later milestones can add vector search.
+### Investigation API
 
-### Safety boundaries
+`POST /api/v1/investigations` runs one investigation synchronously and returns the answer,
+evidence, analysis sections and tool trace:
 
-All tools are read-only. Tool parameters use SQLAlchemy bound expressions, not raw SQL.
-There is no authentication, authorization, tenant isolation, or approval/audit layer yet.
-**Use synthetic data only; do not deploy publicly.** Tool responses can contain untrusted
-document content, so a future LLM agent must not treat retrieved text as instructions.
+```powershell
+$body = '{"question": "Investigate SSO issues for Northstar Labs. Check tickets and documentation.", "max_rounds": 4}'
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/investigations -Method Post -ContentType application/json -Body $body
+```
 
-### CI
+- Request: `question` (1-4000 characters, required), optional `model` (an installed Ollama
+  tag) and `max_rounds` (1-8). Unknown fields are rejected.
+- `200`: `status` is `completed` or `limited` (with `limited_reason`). Other fields:
+  `answer`, `narrative`, `answer_source`, `answer_notice`, `round_limit_reached`,
+  `tool_rounds`, `tool_calls`, `duration_seconds`, `tool_trace`, `evidence`, `analysis`.
+- Errors use one shape, `{"id", "question", "status": "failed", "error": {"code",
+  "message", "details"}, "duration_seconds"}`: `422 invalid_request`, `404
+  model_unavailable`, `503 ollama_unavailable` / `ollama_integration_missing` /
+  `mcp_unavailable` / `model_inference_failed`, `504 timeout`, `500 internal_error`.
+  Messages never include configuration values, paths or exception details.
+- `GET /api/v1/investigations/config` returns the default model, round limits, question
+  length limit and timeout (no URLs or credentials).
 
-The existing `.github/workflows/ci.yml` runs Ruff, pytest (including MCP registration and
-service tests), Alembic migration checks, and Docker image build on every push/PR.
+Runtime settings (environment variables or `.env`, see `.env.example`): `OLLAMA_BASE_URL`,
+`OLLAMA_MODEL`, `INVESTIGATION_TIMEOUT_SECONDS` (default 300, covers queueing too),
+`INVESTIGATION_MAX_ROUNDS` (default 4), `INVESTIGATION_MAX_CONCURRENCY` (default 1;
+further requests queue).
 
-### Database schema
+### CLI
 
-Milestone 3 does not change the database schema; Alembic stays at revision `0001`.
+```powershell
+.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.agent.cli "Investigate SSO issues for Northstar Labs. Check support tickets and documentation. Cite the evidence." --model qwen2.5:3b
+```
+
+`qwen2.5:3b` is a small starting model; tool-calling accuracy and response quality vary.
+If resources allow, try a larger tool-capable model. Ollama model downloads can take
+multiple GB of disk space. Confirm free space before pulling weights.
+
+## Architecture
+
+Browser dashboard (or CLI) -> FastAPI `POST /api/v1/investigations` ->
+`InvestigationService` (concurrency limit, timeout, cancellation; one worker thread and
+event loop per run) -> LangGraph StateGraph with an Ollama chat model -> MCP stdio client ->
+MCP server subprocess (one per investigation) with five read-only tools -> SQLAlchemy ->
+SQLite. The result passes deterministic grounding checks before it is returned. The data
+endpoints (`/api/v1/accounts`, `/api/v1/tickets`, ...) read the database directly.
+
+Tool calls are limited to 4 rounds by default, with at most 5 tool calls per round;
+tool output is truncated to 12,000 characters per call. Unknown tool names are
+rejected. Errors become tool messages for the agent to interpret. The final response
+includes a tool-call trace. There is no persistent memory across runs.
+
+Each investigation's MCP subprocess is closed when the run ends, fails, times out or is
+cancelled (on Windows through a job object, so the venv launcher's child process exits
+too). Uvicorn does not cancel a request handler when the client disconnects, so the
+endpoint polls for a closed connection and cancels the run itself.
+
+### Reliability safeguards for small models
+
+- **Bounded arguments.** Tool schemas publish `minimum`/`maximum` for `limit` (1-20).
+  Out-of-range numbers are clamped to the schema bounds before the MCP call; the trace
+  keeps the original and sent arguments plus an `adjustments` note. Record IDs are never
+  changed. The MCP server still validates every call.
+- **Clean tool errors.** Validation errors reach the model as short, actionable text
+  (for example `Invalid arguments. limit: Input should be less than or equal to 20`).
+  Unexpected server exceptions are logged and returned as a generic message.
+- **Intent-aware follow-ups.** When the model stops, deterministic rules (no extra LLM
+  call) check whether evidence the question explicitly asks for is missing:
+  support-issue terms (ticket, incident, error, failure, ...) require tickets for the
+  verified account the question names; guidance terms (troubleshoot, documentation,
+  how to, next steps, ...) require a knowledge search. Missing lookups run through the
+  same validated tool path, within `max_rounds`, and appear in the trace with
+  `origin: "orchestrator"` and a `reason`. Dependent lookups chain (an account search,
+  then its tickets) while rounds remain. Account-only questions get no ticket lookups, and
+  several matching accounts are never guessed between.
+- **Account discovery.** If a ticket or account question ends with no account lookup at
+  all (in testing, `qwen2.5:3b` sometimes returns an empty first reply), and exactly one
+  account name can be read from the question (a run of capitalised words that are not
+  question words or acronyms such as SSO), `search_accounts` is called with that text.
+  Account IDs still come only from the MCP result. Several candidate names, or none, make
+  the investigation `limited` with an explanation; nothing is guessed. If the model's own
+  account search matched nothing but did not search a name from the question on its own
+  (for example both names in one query), each such name is searched separately; an empty
+  result is a negative finding only for names that were actually searched.
+- **Round budget.** The last tool round goes to required lookups first; the model's own
+  calls in that round run alongside them within the per-round call limit. `max_rounds` is
+  never raised.
+- **Repeated lookups.** An identical call that already succeeded is not re-executed. If a
+  model turn only repeats earlier lookups while required evidence is missing, the
+  orchestrator uses that round for the missing lookup instead.
+- **Transient model failures.** Ollama "token repeat" errors, empty streams and empty
+  replies (no text and no tool call) are retried within a fixed budget of 4 attempts.
+  Persistent empty replies are treated as the model stopping, not as a failure.
+- **Answer = model narrative + deterministic sections.** Record lists and counts never
+  come from the model. Every answer ends with sections rendered from the labelled records:
+  *Relevant support tickets*, *Relevant knowledge documents* (or an explicit statement that
+  documentation-backed guidance is unavailable), *Other retrieved records* and *Unknown or
+  unconfirmed*. The dashboard shows the same sections. The model writes only a short
+  explanatory narrative.
+- **Final synthesis.** Evidence collection and narrative writing are separate. Once the
+  required evidence is in hand and the model stops (or the orchestrator completed the
+  evidence, or the tool-round limit is reached), a single synthesis call, made with the
+  model *without tools*, writes the narrative. It sees only the question and the verified
+  records, grouped by relevance with their IDs. It also replaces a tool-loop answer that
+  fails the grounding checks. Synthesis runs at most once (transient errors are retried
+  within the attempt budget), stays inside the investigation timeout, and is skipped when
+  required evidence is missing.
+- **Grounding for every narrative.** The tool-loop answer, a synthesis, and a synthesis
+  after the round limit all pass the same checks: cited IDs must exist *with the same
+  record type*; records without a topic match must not be presented as related; record
+  counts must match the records (a count of "related" tickets must equal the relevant
+  ones); troubleshooting instructions must cite a relevant retrieved document, otherwise
+  they are removed with a visible note; causal claims get an "unconfirmed" note. A
+  narrative that fails is replaced by a deterministic one (`answer_source:
+  "evidence_summary"` with an `answer_notice`), never an invented conclusion.
+- **Fix claims.** No record confirms that a step resolves a customer's problem, so
+  present- or future-tense claims that one does ("checking the settings resolves the
+  issue", "this will fix the login failures") are softened to "may help resolve/fix", with
+  a visible note. Ticket status wording ("Ticket 2 was resolved", "is resolved"), hedged,
+  negated and quoted text are left unchanged. The synthesis prompt also asks the model not
+  to make such claims.
+- **Status.** `completed`: the required evidence was retrieved and a grounded answer
+  was returned. `limited`: required evidence is still missing (lookup failed, ambiguous or
+  unidentifiable account, or the round budget ran out first), explained in
+  `limited_reason`. Reaching the tool-round limit alone is reported as
+  `round_limit_reached`, not as `limited`. Retrieving records that do not match the
+  question, or finding no matching account, is a complete, negative result (the answer
+  states which search matched nothing). Infrastructure failures in the tool loop are
+  `failed` errors.
+- **Relevance.** Records are labelled by lexical overlap with the question's topic, plus
+  a few explainable groups of related terms (for example *sso*, *saml* and *login* for
+  sign-in problems). Generic symptom words (failure, error, ...) alone do not make a record
+  relevant when the question names a topic. Each relevant record carries a
+  `relevance_basis`. A related topic does not establish a cause.
+
+## Production deployment limitations
+
+The application is built and tested for local, single-user use. Before any shared or
+production deployment it would still need:
+
+- **Security:** no authentication, authorization, tenant isolation or rate limiting. Bind
+  the server to `127.0.0.1` (as above) and do not expose it publicly.
+- **Data:** synthetic seed data only; tools are read-only and there is no approval system.
+- **Scaling:** the concurrency limit and request queue live in one server process; several
+  Uvicorn workers would each apply their own limit.
+- **Operations:** no observability backend (the trace is per run), and the application's
+  INFO logs are not shown under Uvicorn's default logging configuration.
+- **Testing:** CI uses fake LLM/MCP clients (no Ollama or model download). Real-model and
+  browser checks are run manually.
+
+### Docker (current limitations)
+
+The `Dockerfile` builds and starts the API and dashboard, and CI builds the image, but the
+image is not yet a working investigation environment (planned for Milestone 8):
+
+- It installs the package without the `agent` extra, so investigations return `503
+  ollama_integration_missing`.
+- `OLLAMA_BASE_URL` defaults to `127.0.0.1`, which inside a container is the container
+  itself. Ollama on the host needs `host.docker.internal` or a shared network.
+- The image contains neither `migrations/`/`alembic.ini` nor a database, and nothing creates
+  tables at startup, so the data endpoints and tools fail unless a prepared SQLite file is
+  mounted and `DATABASE_URL` points to it.
+- There is no compose file, health check or Ollama service definition.
+
+## Answer accuracy limitations
+
+- Evidence grounding is rule-based and prompted, **not formally verified**. Check
+  citations against the tool output. There is no guarantee of factual correctness or of
+  immunity to prompt injection.
+- Knowledge search uses lexical token overlap, not embeddings/vector retrieval.
+- The guards check record IDs and types, relevance claims, record counts, uncited
+  troubleshooting instructions and causal wording. They do not check the model's
+  interpretation: a narrative may still overstate (for example, calling a resolved
+  ticket "the solution"). The deterministic sections below the narrative are the
+  authoritative record list.
+- Troubleshooting advice is detected by phrasing (imperatives, "you should", "next
+  steps"...). Softer wording such as "it is important to address this" is not removed.
+- Fix claims are detected by phrasing too: "X resolves/fixes/will fix ..." is softened, but
+  paraphrases such as "is the solution" or "addresses the root problem", and past-tense
+  claims ("this resolved the issue"), are not changed.
+- Account discovery reads capitalised names. Lowercase names, or a single-word name at
+  the start of a sentence, are not recovered. A capitalised product name next to an
+  account name makes the question ambiguous, and the run ends `limited` instead.
+- Relevance is lexical, with a few hand-written groups of related terms; it is not
+  semantic search.
+- `qwen2.5:3b` often spends tool rounds on invented IDs (blocked) or repeated calls. Real
+  investigations took about 12-160 s on a laptop (most 30-90 s); a question with no
+  identifiable account can use the whole round budget before it ends `limited`.
+- Reliability figures come from small manual batches (8 real runs each), not a benchmark.
+
+## Existing MCP server
+
+```powershell
+.venv\Scripts\python.exe scripts\smoke_mcp.py
+```
+
+The server supports `search_accounts`, `get_account_tickets`, `get_ticket_details`,
+`get_product_information`, and `search_knowledge`.

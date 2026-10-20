@@ -15,7 +15,7 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Lint
         run: ruff check .
-      - name: Test
+      - name: Test (API, MCP, agent; no Ollama required)
         run: pytest -q
       - name: Check migrations
         run: |

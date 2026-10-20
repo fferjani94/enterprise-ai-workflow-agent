@@ -62,7 +62,7 @@ def test_unverified_account_id_is_rejected_without_calling_mcp():
     assert client.calls == []
     assert result["tool_trace"][0]["success"] is False
     assert result["tool_trace"][0]["record_count"] == 0
-    assert "Insufficient verified evidence" in result["answer"]
+    assert "insufficient verified evidence" in result["answer"].lower()
 
 
 def test_verified_account_and_tickets_are_used_and_reported():
@@ -71,12 +71,15 @@ def test_verified_account_and_tickets_are_used_and_reported():
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1}, "b"),
         AIMessage(content="Northstar Labs has no support tickets."),
+        # The contradicting answer goes to synthesis, which contradicts the evidence again.
+        AIMessage(content="There are no support tickets for this account."),
     ])
     result = asyncio.run(investigate("Find tickets", model, client, TOOLS))
     assert client.calls[1] == ("get_account_tickets", {"account_id": 1})
     assert result["tool_trace"][1]["record_count"] == 1
-    assert "Ticket 2: SSO login failure" in result["answer"]
+    assert 'Ticket 2, "SSO login failure"' in result["answer"]
     assert "contained an unsupported" in result["answer"]
+    assert result["answer_source"] == "evidence_summary"
 
 
 def test_unknown_product_id_is_rejected_but_unfiltered_knowledge_is_allowed():
@@ -108,5 +111,5 @@ def test_invented_id_in_final_answer_is_replaced():
         AIMessage(content="The account ID is 12345."),
     ])
     result = asyncio.run(investigate("Find account", model, client, TOOLS))
-    assert "Account 1: Northstar Labs" in result["answer"]
+    assert 'Account 1, "Northstar Labs"' in result["answer"]
     assert "12345" not in result["answer"]

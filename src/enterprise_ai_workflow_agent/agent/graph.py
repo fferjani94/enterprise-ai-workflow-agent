@@ -15,7 +15,13 @@ from langchain_core.messages import (
 )
 from langgraph.graph import END, START, StateGraph, add_messages
 
-from enterprise_ai_workflow_agent.agent.followups import FollowUp, classify_intent, plan_evidence
+from enterprise_ai_workflow_agent.agent.followups import (
+    FollowUp,
+    classify_intent,
+    plan_evidence,
+    search_covers,
+    unresolved_listed_accounts,
+)
 from enterprise_ai_workflow_agent.agent.grounding import (
     CAUSAL_NOTE,
     FIX_CLAIM_NOTE,
@@ -27,6 +33,7 @@ from enterprise_ai_workflow_agent.agent.grounding import (
     qualify_fix_claims,
     remove_uncited_guidance,
     render_sections,
+    requested_ticket_statuses,
     unrelated_mentions,
 )
 from enterprise_ai_workflow_agent.agent.synthesis import SYNTHESIS_PROMPT, synthesis_input
@@ -306,8 +313,11 @@ def _succeeded_keys(trace: list[dict[str, Any]]) -> set[str]:
     }
 
 
-def _labelled_records(question: str, evidence: dict[str, Any]) -> list[dict[str, Any]]:
-    return classify_relevance(question, _structured_evidence(evidence))
+def _labelled_records(
+    question: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    return classify_relevance(question, _structured_evidence(evidence),
+                              unresolved_listed_accounts(question, evidence, trace))
 
 
 def _answer_problem(
@@ -537,9 +547,10 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
     def uncovered_followups(state: AgentState) -> list[FollowUp]:
         """Required lookups that the model's pending tool request does not already cover.
 
-        Coverage follows what the plan needs: any account search, any knowledge search, or
-        tickets for the same account. A call that repeats an earlier attempt covers nothing:
-        it is skipped as a duplicate or fails again the same way.
+        Coverage follows what the plan needs: an account search whose query covers the
+        planned name, any knowledge search, or tickets for the same account. A call that
+        repeats an earlier attempt covers nothing: it is skipped as a duplicate or fails
+        again the same way.
         """
         attempted = attempted_keys(state)
         requested = [
@@ -549,14 +560,26 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             and not is_repeat(call, attempted)
         ]
 
-        def covered(item: FollowUp) -> bool:
-            return any(
-                name == item.tool and (item.tool != "get_account_tickets"
-                                       or args.get("account_id") == item.arguments["account_id"])
-                for name, args in requested
-            )
+        def covers(item: FollowUp, name: str, args: dict[str, Any]) -> bool:
+            if name != item.tool:
+                return False
+            if item.tool == "get_account_tickets":
+                return args.get("account_id") == item.arguments["account_id"]
+            if item.tool == "search_accounts":
+                return search_covers(args.get("query"), item.arguments["query"])
+            return True
 
-        return [item for item in pending_followups(state) if not covered(item)]
+        return [item for item in pending_followups(state)
+                if not any(covers(item, name, args) for name, args in requested)]
+
+    def reserved_rounds(state: AgentState) -> int:
+        """Rounds that required lookups still need: an account search, then its tickets."""
+        pending = uncovered_followups(state)
+        if not pending:
+            return 0
+        chained = (classify_intent(state["question"]).tickets
+                   and any(item.tool == "search_accounts" for item in pending))
+        return 2 if chained else 1
 
     def route(state: AgentState) -> str:
         latest = state["messages"][-1]
@@ -572,14 +595,16 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             if (all(is_repeat(call, attempted) for call in latest.tool_calls)
                     and uncovered_followups(state)):
                 return "followup"
-            # The last round goes to required evidence first; the model's own calls run
-            # alongside them within the per-round call limit.
-            if state["tool_rounds"] == max_rounds - 1 and uncovered_followups(state):
+            # The last rounds go to required evidence first (two when an account search
+            # must precede its tickets); the model's own calls run alongside them within
+            # the per-round call limit.
+            reserved = reserved_rounds(state)
+            if reserved and state["tool_rounds"] >= max_rounds - reserved:
                 return "followup"
             return "tools"
         if state["tool_rounds"] < max_rounds and pending_followups(state):
             return "followup"
-        records = _labelled_records(state["question"], state["evidence"])
+        records = _labelled_records(state["question"], state["evidence"], state["tool_trace"])
         if not records or state["synthesis_attempted"]:
             return "done"
         # Evidence collection is over: with the required evidence in hand, the final answer
@@ -622,10 +647,10 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             for index, item in enumerate(pending)
         ]
         planned = {_call_key(item.tool, item.arguments) for item in pending}
-        succeeded = _succeeded_keys(state["tool_trace"])
+        attempted = attempted_keys(state)
         model_calls = [
             call for call in (getattr(latest, "tool_calls", None) or [])
-            if not is_repeat(call, succeeded) and not (
+            if not is_repeat(call, attempted) and not (
                 call["name"] in tool_names and isinstance(call["args"], dict)
                 and _call_key(call["name"], prepare_arguments(call["name"], call["args"])[0])
                 in planned)
@@ -655,7 +680,7 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
         the answer is then a deterministic evidence summary.
         """
         done: dict[str, Any] = {"synthesis_attempted": True}
-        records = _labelled_records(state["question"], state["evidence"])
+        records = _labelled_records(state["question"], state["evidence"], state["tool_trace"])
         plan = plan_evidence(state["question"], state["evidence"], state["tool_trace"])
         if plan.gaps or plan.calls or not records:
             return {**done, "messages": [AIMessage(content="")],
@@ -728,14 +753,15 @@ async def investigate(
         }
     )
     evidence = result["evidence"]
-    records = _labelled_records(question, evidence)
+    records = _labelled_records(question, evidence, result["tool_trace"])
     limited_reason = _limited_reason(question, result, max_rounds)
     intent = classify_intent(question)
     analysis = build_analysis(
         records,
         expects_tickets=intent.tickets,
         issue_question=intent.tickets or intent.knowledge,
-        notes=_unmatched_account_searches(result["tool_trace"]),
+        notes=_unmatched_account_searches(result["tool_trace"], evidence),
+        ticket_statuses=requested_ticket_statuses(question),
     )
     sections = render_sections(analysis)
     source, notice = result["answer_source"], result["answer_notice"]
@@ -798,13 +824,23 @@ def _ground_narrative(
     return narrative, None
 
 
-def _unmatched_account_searches(trace: list[dict[str, Any]]) -> tuple[str, ...]:
-    """Grounded negative results: account searches that succeeded but matched nothing."""
+def _unmatched_account_searches(
+    trace: list[dict[str, Any]], evidence: dict[str, Any]
+) -> tuple[str, ...]:
+    """Grounded negative results: account searches that succeeded but matched nothing.
+
+    A query containing a verified account's name ("Northstar Labs Bluebird Commerce")
+    was only over-specific, so its empty result says nothing and is left out.
+    """
+    verified = [" ".join(str(a.get("name") or "").split()).casefold()
+                for a in evidence["accounts"].values()]
     queries = []
     for entry in trace:
         query = (entry.get("normalized_arguments") or {}).get("query")
         if (entry.get("tool") == "search_accounts" and entry.get("success")
-                and not entry.get("record_count") and query and query not in queries):
+                and not entry.get("record_count") and query and query not in queries
+                and not any(name and name in " ".join(str(query).split()).casefold()
+                            for name in verified)):
             queries.append(query)
     return tuple(f'No account matched the search "{query}".' for query in queries)
 
@@ -848,7 +884,7 @@ def _limited_reason(question: str, result: dict[str, Any], max_rounds: int) -> s
                   "retrieved." if exhausted else "")
         return "Required evidence is missing. " + " ".join(gaps) + budget
     if (result["round_limit_reached"] and not any(result["evidence"].values())
-            and not _unmatched_account_searches(result["tool_trace"])):
+            and not _unmatched_account_searches(result["tool_trace"], result["evidence"])):
         # A named account that was searched and not found is a complete negative result.
         return (f"The tool-round limit ({max_rounds}) was reached before any records were "
                 "retrieved.")

@@ -12,13 +12,17 @@ Intent comes from explicit terms in the question:
 - account:   account-attribute terms (account, plan, industry, subscription, tier).
 An account-only question ("What plan is X on?") never triggers a ticket lookup.
 
-Account discovery: when a ticket or account question was answered without any account
-lookup, and exactly one account name can be read from the question (a run of capitalised
-words, see account_references), search_accounts is called with that text. Account IDs
-still come only from the MCP result. Several candidate names are never guessed between.
-If an account search matched nothing but its query did not correspond to a name in the
-question (for example two names combined in one query), each unsearched name is searched
-separately; finding nothing is a negative result only for names that were searched.
+Account discovery: the requested account names are the single name read from the question
+(a run of capitalised words, see account_references) or, when there are several, the names
+listed together ("X and Y", "X, Y"). Each requested name is tracked independently, from
+the trace and the verified evidence (see account_status):
+- resolved:   one verified account contains the name (or equals it)
+- ambiguous:  several verified accounts contain it; none is chosen
+- not found:  a successful search whose query covers the name matched no account with it
+- failed:     the orchestrator's own search for the name failed; it is not retried
+- unsearched: no successful covering search yet; search_accounts is planned with the name
+Account IDs still come only from MCP results. Several unlisted capitalised phrases are never
+guessed between.
 """
 
 import re
@@ -89,18 +93,24 @@ def account_references(question: str) -> list[str]:
     """
     found: list[str] = []
     for sentence in _SENTENCE_END.split(question):
-        words = [m.group(0) for m in _WORD.finditer(sentence)]
-        run: list[str] = []
-        for index, word in enumerate([*words, ""]):
-            if word and _is_name_word(word):
-                run.append(word)
+        matches = list(_WORD.finditer(sentence))
+        run: list[int] = []  # indices into matches
+        for index in range(len(matches) + 1):
+            word = matches[index].group(0) if index < len(matches) else ""
+            gap = (sentence[matches[index - 1].end():matches[index].start()].strip()
+                   if 0 < index < len(matches) else "")
+            # Punctuation ends a name ("Northstar Labs, Bluebird Commerce"); "&" after a
+            # single word joins it ("Procter & Gamble"), otherwise it separates names.
+            joins = not gap or (gap == "&" and len(run) == 1)
+            if word and _is_name_word(word) and (not run or joins):
+                run.append(index)
                 continue
-            starts_sentence = index - len(run) == 0
-            if run and not (starts_sentence and len(run) == 1):
-                name = _POSSESSIVE.sub("", " ".join(run)).rstrip(".")
+            if run and not (run[0] == 0 and len(run) == 1):
+                text = sentence[matches[run[0]].start():matches[run[-1]].end()]
+                name = _POSSESSIVE.sub("", " ".join(text.split())).rstrip(".")
                 if name.casefold() not in {f.casefold() for f in found}:
                     found.append(name)
-            run = []
+            run = [index] if word and _is_name_word(word) else []
     return found
 
 
@@ -180,23 +190,78 @@ def knowledge_query(question: str, evidence: dict[str, Any]) -> str:
     return " ".join(ordered[:MAX_KNOWLEDGE_QUERY_TERMS])
 
 
-def _unsearched_references(references: list[str], trace: list[dict[str, Any]]) -> list[str]:
-    """Names from the question that no successful account search covered.
+RESOLVED, AMBIGUOUS, NOT_FOUND, FAILED, UNSEARCHED = (
+    "resolved", "ambiguous", "not_found", "failed", "unsearched")
 
-    A search covers a name when its query is the name or a part of it ("Globex" covers
-    "Globex Corporation"); a query that adds other words ("Northstar Labs Bluebird
-    Commerce") does not, since finding nothing for it says nothing about either name.
+
+def _folded(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def search_covers(query: Any, name: str) -> bool:
+    """Whether an account search with this query would return every account named `name`.
+
+    search_accounts matches names by case-insensitive substring, so a query covers a name
+    when it is the name or a part of it ("Globex" covers "Globex Corporation"); a query that
+    adds other words ("Northstar Labs Bluebird Commerce") does not.
     """
-    queries = [
-        " ".join(_tokens(str((entry.get("normalized_arguments") or {}).get("query") or "")))
-        for entry in trace
-        if entry.get("tool") == "search_accounts" and entry.get("success")
-    ]
-    return [
-        name for name in references
-        if not any(query and f" {query} " in f" {' '.join(_tokens(name))} "
-                   for query in queries)
-    ]
+    folded = _folded(query)
+    return bool(folded) and folded in _folded(name)
+
+
+def account_status(
+    name: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> tuple[str, list[int]]:
+    """Resolution state of one requested account name, and the verified IDs it matches."""
+    matches = [account_id for account_id, account in evidence["accounts"].items()
+               if _folded(name) in _folded(account.get("name"))]
+    exact = [account_id for account_id in matches
+             if _folded(evidence["accounts"][account_id].get("name")) == _folded(name)]
+    searches = [entry for entry in trace if entry.get("tool") == "search_accounts"
+                and search_covers((entry.get("normalized_arguments") or {}).get("query"),
+                                  name)]
+    covered = any(entry.get("success") for entry in searches)
+    if len(exact) == 1 or (covered and len(matches) == 1):
+        return RESOLVED, exact or matches
+    if len(matches) > 1:
+        return AMBIGUOUS, matches
+    if covered:
+        return NOT_FOUND, []
+    own_search = {"query": name}
+    if any(entry.get("normalized_arguments") == own_search for entry in searches):
+        return FAILED, []
+    return UNSEARCHED, []
+
+
+def _listed_references(question: str, references: list[str]) -> list[str]:
+    """Names that the question lists together with another name ("X and Y", "X, Y")."""
+    listed: list[str] = []
+    for first, second in zip(references, references[1:]):
+        pattern = (re.escape(first) + r"(?:'s|’s|'|’)?\s*(?:,\s*(?:and\s+|or\s+)?|\s+(?:and"
+                   r"|or|&|vs\.?|versus)\s+)(?:the\s+)?" + re.escape(second))
+        if re.search(pattern, question, re.IGNORECASE):
+            listed.extend(name for name in (first, second) if name not in listed)
+    return listed
+
+
+def requested_names(question: str) -> list[str]:
+    """The one account name in the question, or the names it lists together."""
+    references = account_references(question)
+    return references if len(references) == 1 else _listed_references(question, references)
+
+
+def unresolved_listed_accounts(
+    question: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> tuple[str, ...]:
+    """Listed account names left unresolved while another name in the list was verified.
+
+    Listed alongside a verified account, such a name is an account, not a topic.
+    """
+    listed = _listed_references(question, account_references(question))
+    states = {name: account_status(name, evidence, trace)[0] for name in listed}
+    if RESOLVED not in states.values():
+        return ()
+    return tuple(name for name, state in states.items() if state != RESOLVED)
 
 
 def plan_evidence(
@@ -208,6 +273,13 @@ def plan_evidence(
     gaps: list[str] = []
     if intent.tickets and evidence["accounts"]:
         targets, ambiguous = _target_accounts(question, evidence["accounts"])
+        # A shortened name ("Northstar") that resolved to one verified account is a target too.
+        for name in requested_names(question):
+            status, ids = account_status(name, evidence, trace)
+            if status == RESOLVED:
+                targets.extend(i for i in ids if i not in targets)
+        targets = targets[:MAX_FOLLOWUP_ACCOUNTS]
+        ambiguous = ambiguous and not targets
         if ambiguous:
             ids = ", ".join(str(i) for i in sorted(evidence["accounts"]))
             gaps.append(
@@ -236,42 +308,43 @@ def _plan_account_lookup(
     question: str, intent: Intent, evidence: dict[str, Any], trace: list[dict[str, Any]],
     calls: list[FollowUp], gaps: list[str],
 ) -> None:
-    """Recover a skipped account lookup, or explain why the account is unknown."""
-    if not (intent.tickets or intent.account) or evidence["accounts"]:
+    """Resolve each requested account name, or explain why an account is unknown."""
+    if not (intent.tickets or intent.account):
         return
-    attempted = any(entry.get("tool") == "search_accounts" for entry in trace)
-    searched = _succeeded(trace, "search_accounts")
     references = account_references(question)
-    if not attempted and len(references) == 1:
-        calls.append(FollowUp(
-            "search_accounts", {"query": references[0]},
-            f"The question is about the account \"{references[0]}\", but no account lookup "
-            "had been made.",
-        ))
-        return
-    if references and searched:
-        # Matching nothing is a negative result only for the names actually searched.
-        # Observed with qwen2.5:3b: "Northstar Labs Bluebird Commerce" in a single query.
-        unsearched = _unsearched_references(references, trace)
-        if not unsearched:
-            return
-        if len(unsearched) <= MAX_FOLLOWUP_ACCOUNTS:
-            calls.extend(FollowUp(
-                "search_accounts", {"query": name},
-                f"The question names the account \"{name}\", but no account search had used "
-                "that name.",
-            ) for name in unsearched)
-            return
-    if len(references) > 1:
+    requested = requested_names(question)
+    if evidence["accounts"] and len(requested) < 2:
+        return  # one account: the verified accounts are matched by _target_accounts
+    if len(references) > 1 and not requested:
         names = ", ".join(f'"{name}"' for name in references)
         gaps.append(
             f"The question mentions several possible account names ({names}), so no "
             "account was looked up automatically. Name one account to investigate."
         )
-    elif references:
-        gaps.append("The question asks about support tickets or account details, but no "
-                    "account lookup succeeded.")
-    elif intent.explicit_tickets or intent.account or not trace:
+        return
+    if len(requested) > MAX_FOLLOWUP_ACCOUNTS:
+        gaps.append(
+            f"The question names {len(requested)} accounts; at most {MAX_FOLLOWUP_ACCOUNTS} "
+            "are investigated automatically. Name fewer accounts."
+        )
+        return
+    for name in requested:
+        status, ids = account_status(name, evidence, trace)
+        if status == UNSEARCHED:
+            calls.append(FollowUp(
+                "search_accounts", {"query": name},
+                f"The question names the account \"{name}\", but no account search covering "
+                "that name had succeeded.",
+            ))
+        elif status == FAILED:
+            gaps.append(f"The account search for \"{name}\" failed, so the account could "
+                        "not be verified.")
+        elif status == AMBIGUOUS:
+            gaps.append(
+                f"The name \"{name}\" matches several verified accounts "
+                f"({', '.join(str(i) for i in sorted(ids))}); none was chosen automatically."
+            )
+    if not references and (intent.explicit_tickets or intent.account or not trace):
         # A search the model invented (the question names no account) verifies nothing.
         gaps.append(
             "The question asks about support tickets or account details, but it names no "

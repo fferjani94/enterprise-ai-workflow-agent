@@ -8,14 +8,31 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage
 from mcp.shared.memory import create_connected_server_and_client_session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
-from enterprise_ai_workflow_agent.agent.followups import classify_intent, knowledge_query
+from enterprise_ai_workflow_agent.agent.followups import (
+    account_references,
+    classify_intent,
+    knowledge_query,
+    plan_evidence,
+    unresolved_listed_accounts,
+)
 from enterprise_ai_workflow_agent.agent.graph import (
+    _unmatched_account_searches,
     clamp_bounded_arguments,
     clean_tool_error,
     investigate,
 )
-from enterprise_ai_workflow_agent.mcp_server import server
+from enterprise_ai_workflow_agent.agent.grounding import (
+    build_analysis,
+    requested_ticket_statuses,
+)
+from enterprise_ai_workflow_agent.db import seed as seed_module
+from enterprise_ai_workflow_agent.db.base import Base
+from enterprise_ai_workflow_agent.db.models import Account
+from enterprise_ai_workflow_agent.mcp_server import server, services
 
 LIMIT = {"type": "integer", "minimum": 1, "maximum": 20, "default": 10}
 
@@ -384,13 +401,33 @@ def test_unknown_account_from_recovery_is_a_complete_negative_result():
     assert 'No account matched the search "Acme Robotics".' in notes
 
 
-def test_several_account_names_are_not_guessed_and_mark_the_run_limited():
+def test_listed_account_names_are_each_searched_independently():
+    client = AccountDirectory(accounts=(NORTHSTAR, NORTHWIND))
     result, client, _ = run("Compare open tickets for Northstar Labs and Northwind Retail.",
+                            [AIMessage(content="Both have tickets."),
+                             AIMessage(content="Ticket 11 is open.")], client=client)
+    assert client.calls == [
+        ("search_accounts", {"query": "Northstar Labs"}),
+        ("search_accounts", {"query": "Northwind Retail"}),
+        ("get_account_tickets", {"account_id": 1}),
+        ("get_account_tickets", {"account_id": 2}),
+    ]
+    assert result["limited"] is False
+
+
+def test_unlisted_capitalised_phrases_are_not_searched_as_accounts():
+    result, client, _ = run("Investigate CloudDesk tickets for Northstar Labs.",
                             [AIMessage(content="Both have tickets.")])
     assert client.calls == []
     assert result["limited"] is True
-    assert '"Northstar Labs", "Northwind Retail"' in result["limited_reason"]
+    assert '"CloudDesk", "Northstar Labs"' in result["limited_reason"]
     assert "Name one account" in result["limited_reason"]
+    result, client, _ = run("Investigate CloudDesk tickets for Northstar Labs.", [
+        call("search_accounts", {"query": "Northstar Labs"}, "a"),
+        AIMessage(content="Found it."), AIMessage(content="Ticket 11.")])
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
+                            ("get_account_tickets", {"account_id": 1})]
+    assert result["limited"] is False
 
 
 def test_question_without_an_account_name_is_limited_without_lookup():
@@ -456,14 +493,18 @@ def test_partial_name_search_that_matched_nothing_is_a_negative_result():
 
 
 def test_unsearched_names_without_rounds_left_make_the_run_limited():
+    # With one round, the required account searches take it; no round is left for tickets.
     client = AccountDirectory(accounts=(NORTHSTAR, NORTHWIND))
     result, client, _ = run(
         "List all open support tickets for Northstar Labs and Northwind Retail.",
         [call("search_accounts", {"query": "Northstar Labs Northwind Retail"}, "a"),
          AIMessage(content="No accounts were found.")], client=client, max_rounds=1)
-    assert len(client.calls) == 1
+    assert [args["query"] for _, args in client.calls] == [
+        "Northstar Labs", "Northwind Retail", "Northstar Labs Northwind Retail"]
+    assert result["tool_rounds"] == 1
     assert result["limited"] is True
-    assert 'names the account "Northstar Labs"' in result["limited_reason"]
+    assert "tickets for verified account 1" in result["limited_reason"]
+    assert "tickets for verified account 2" in result["limited_reason"]
 
 
 def test_model_repeating_a_combined_search_and_a_failed_lookup_is_treated_as_stalled():
@@ -516,15 +557,17 @@ def test_round_limit_before_any_record_is_limited():
     assert "before any records were retrieved" in result["limited_reason"]
 
 
-def test_recovery_is_not_used_after_the_model_attempted_an_account_lookup():
+def test_failed_account_search_gets_one_recovery_attempt_and_no_retry_loop():
     client = FakeMCP(failing={"search_accounts"})
     result, client, _ = run("Does Northstar Labs have open tickets?", [
         call("search_accounts", {"query": "Northstar"}, "a"),
         AIMessage(content="The lookup failed."),
-    ], client=client)
-    assert client.calls == [("search_accounts", {"query": "Northstar"})]
+    ], client=client, max_rounds=8)
+    assert client.calls == [("search_accounts", {"query": "Northstar"}),
+                            ("search_accounts", {"query": "Northstar Labs"})]
+    assert result["tool_rounds"] == 2
     assert result["limited"] is True
-    assert "no account lookup succeeded" in result["limited_reason"]
+    assert 'account search for "Northstar Labs" failed' in result["limited_reason"]
 
 
 # --- Round budget ------------------------------------------------------------------
@@ -603,4 +646,407 @@ def test_stalled_model_repeating_lookups_is_replaced_by_required_follow_up():
                             ("get_account_tickets", {"account_id": 1})]
     assert [entry["origin"] for entry in result["tool_trace"]] == ["model", "orchestrator"]
     assert result["tool_rounds"] == 2
+    assert result["limited"] is False
+
+
+# --- Multi-account resolution against the real seed data ----------------------------
+
+class SeededMCP:
+    """Runs the real MCP service functions on the production seed, in memory."""
+
+    def __init__(self, monkeypatch, extra_accounts=()):
+        engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool,
+                               connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+        self.sessions = sessionmaker(bind=engine, expire_on_commit=False)
+        monkeypatch.setattr(seed_module, "SessionLocal", self.sessions)
+        seed_module.seed()
+        with self.sessions.begin() as db:
+            db.add_all(Account(**account) for account in extra_accounts)
+        self.calls = []
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, args))
+        try:
+            with self.sessions() as db:
+                result = getattr(services, name)(db, **args)
+        except (TypeError, ValueError) as exc:
+            text = f"Error executing tool {name}: {exc}"
+            return SimpleNamespace(isError=True, structuredContent=None,
+                                   content=[SimpleNamespace(type="text", text=text)])
+        return SimpleNamespace(isError=False, structuredContent={"result": result},
+                               content=[])
+
+
+TWO_ACCOUNTS = ("List all open support tickets for Northstar Labs and Bluebird Commerce, "
+                "including their priority.")
+# From db/seed.py: account 1 Northstar Labs (Software, Enterprise), account 2 Bluebird
+# Commerce; tickets 1 (Northstar, open, high), 2 (Northstar, resolved, medium) and
+# 3 (Bluebird, open, medium).
+SEEDED_TICKETS = {1: (1, "open", "high"), 2: (1, "resolved", "medium"),
+                  3: (2, "open", "medium")}
+
+
+def _records(result, kind):
+    return {r["id"]: r for r in result["evidence"] if r["type"] == kind}
+
+
+def _tickets(result):
+    return {i: (r["fields"]["account_id"], r["fields"]["status"], r["fields"]["priority"])
+            for i, r in _records(result, "ticket").items()}
+
+
+def _searches(client):
+    return [args.get("query") for name, args in client.calls if name == "search_accounts"]
+
+
+def test_single_known_account_is_resolved_once(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(
+        "What plan is Northstar Labs on, and what industry does it operate in?",
+        [call("search_accounts", {"query": "Northstar Labs"}, "a"),
+         AIMessage(content="Northstar Labs (Account 1) is on the Enterprise plan, Software.")],
+        client=client)
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"})]
+    account = _records(result, "account")[1]
+    assert (account["title"], account["fields"]["plan"], account["fields"]["industry"]) == (
+        "Northstar Labs", "Enterprise", "Software")
+    assert result["limited"] is False
+
+
+def test_two_named_accounts_are_resolved_and_their_tickets_retrieved(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(TWO_ACCOUNTS, [
+        AIMessage(content="Both have tickets."),
+        AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
+    ], client=client)
+    assert client.calls == [
+        ("search_accounts", {"query": "Northstar Labs"}),
+        ("search_accounts", {"query": "Bluebird Commerce"}),
+        ("get_account_tickets", {"account_id": 1}),
+        ("get_account_tickets", {"account_id": 2}),
+    ]
+    assert {i: r["title"] for i, r in _records(result, "account").items()} == {
+        1: "Northstar Labs", 2: "Bluebird Commerce"}
+    assert _tickets(result) == SEEDED_TICKETS
+    assert result["tool_rounds"] == 2
+    assert result["limited"] is False
+    assert "several possible account names" not in result["answer"]
+    # "including" is not a topic: the tickets are not labelled unrelated to the question.
+    assert result["answer_source"] == "synthesis"
+    assert result["narrative"] == "Ticket 1 (high) and Ticket 3 (medium) are open."
+    # "open support tickets" filters the summary; resolved ticket 2 stays in the evidence.
+    findings = " ".join(item["text"] for item in result["analysis"]["findings"])
+    assert "Ticket 1," in findings and "Ticket 3," in findings
+    assert "Ticket 2," not in findings
+    assert any(item["text"].startswith('Ticket 2, "Dashboard loading slowly" (resolved, '
+                                       'medium), was retrieved but does not have the status')
+               for item in result["analysis"]["context"])
+
+
+def test_superseded_combined_search_is_not_reported_as_unmatched(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(TWO_ACCOUNTS, [
+        call("search_accounts", {"query": "Northstar Labs Bluebird Commerce"}, "a"),
+        AIMessage(content="No accounts were found."),
+        AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
+    ], client=client)
+    assert _tickets(result) == SEEDED_TICKETS
+    assert "No account matched" not in result["answer"]
+    assert result["limited"] is False
+
+
+def test_combined_search_with_an_unknown_account_keeps_the_genuine_negative(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(
+        "List open support tickets for Northstar Labs and Globex Corporation.",
+        [call("search_accounts", {"query": "Northstar Labs Globex Corporation"}, "a"),
+         AIMessage(content="No accounts were found."),
+         AIMessage(content="Ticket 1 is open.")], client=client)
+    notes = [item["text"] for item in result["analysis"]["unconfirmed"]]
+    assert 'No account matched the search "Globex Corporation".' in notes
+    assert not any("Northstar Labs Globex" in note for note in notes)
+    assert result["limited"] is False
+
+
+def test_combined_search_note_is_kept_until_a_named_account_is_verified():
+    trace = [{"tool": "search_accounts", "success": True, "record_count": 0,
+              "normalized_arguments": {"query": "Northstar Labs Bluebird Commerce"}}]
+    unverified = {"accounts": {}}
+    verified = {"accounts": {1: {"id": 1, "name": "Northstar Labs"}}}
+    assert _unmatched_account_searches(trace, unverified) == (
+        'No account matched the search "Northstar Labs Bluebird Commerce".',)
+    assert _unmatched_account_searches(trace, verified) == ()
+
+
+def test_unknown_listed_account_does_not_make_known_tickets_unrelated(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(
+        "List all open support tickets for Northstar Labs and Globex Corporation, "
+        "including their priority.",
+        [AIMessage(content="Both have tickets."),
+         AIMessage(content="Ticket 1 (high) is open for Northstar Labs.")], client=client)
+    assert _tickets(result) == {i: t for i, t in SEEDED_TICKETS.items() if t[0] == 1}
+    assert {r["relevance"] for r in _records(result, "ticket").values()} == {"unassessed"}
+    assert result["answer_source"] == "synthesis"
+    assert result["narrative"] == "Ticket 1 (high) is open for Northstar Labs."
+    findings = " ".join(item["text"] for item in result["analysis"]["findings"])
+    assert "Ticket 1," in findings and "Ticket 2," not in findings
+    assert 'No account matched the search "Globex Corporation".' in result["answer"]
+    assert result["limited"] is False
+
+
+def test_topic_terms_still_apply_next_to_an_unknown_listed_account(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(
+        "Investigate SSO login failures for Northstar Labs and Globex Corporation.",
+        [AIMessage(content="Both have tickets."),
+         AIMessage(content="Ticket 2 is related to the login failures.")], client=client)
+    tickets = _records(result, "ticket")
+    assert (tickets[1]["relevance"], tickets[2]["relevance"]) == ("relevant", "no_match")
+    assert result["answer_source"] == "evidence_summary"
+    assert "described records as related" in result["answer_notice"]
+
+
+def test_ambiguous_listed_name_does_not_make_known_tickets_unrelated(monkeypatch):
+    client = SeededMCP(monkeypatch, extra_accounts=[ROBOTICS])
+    result, client, _ = run("List open tickets for Northstar and Bluebird Commerce.",
+                            [AIMessage(content="Both have tickets.")], client=client)
+    assert _records(result, "ticket")[3]["relevance"] == "unassessed"
+    findings = " ".join(item["text"] for item in result["analysis"]["findings"])
+    assert "Ticket 3," in findings
+    assert set(_tickets(result)) == {3}
+    assert result["limited"] is True
+
+
+@pytest.mark.parametrize("question, accounts, unresolved", [
+    ("Open tickets for Northstar Labs and Globex Corporation?", {1: NORTHSTAR},
+     ("Globex Corporation",)),
+    # Nothing in the list is a verified account, so the names may be topics.
+    ("Open tickets for CloudDesk and FlowSync?", {}, ()),
+    ("Investigate Webhook failures for Northstar Labs.", {1: NORTHSTAR}, ()),
+])
+def test_only_names_listed_with_a_verified_account_stop_being_topics(
+        question, accounts, unresolved):
+    evidence = {"accounts": accounts, "tickets": {}, "products": {}, "documents": {}}
+    assert unresolved_listed_accounts(question, evidence, []) == unresolved
+
+@pytest.mark.parametrize("question, statuses", [
+    ("List all open support tickets for Northstar Labs.", {"open"}),
+    ("Show closed tickets for Northstar Labs.", {"closed", "resolved"}),
+    ("Why can't users open the dashboard at Northstar Labs?", set()),
+    ("Investigate the tickets for Northstar Labs.", set()),
+])
+def test_ticket_status_filter_comes_from_explicit_wording(question, statuses):
+    assert requested_ticket_statuses(question) == statuses
+
+
+def test_status_filter_without_matching_tickets_says_so():
+    records = [{"type": "ticket", "id": 2, "title": "Dashboard loading slowly",
+                "description": None, "relevance": "unassessed",
+                "fields": {"status": "resolved", "priority": "medium"}}]
+    analysis = build_analysis(records, expects_tickets=True,
+                              ticket_statuses=frozenset({"open"}))
+    assert [item["text"] for item in analysis["findings"]] == [
+        "No retrieved ticket has the requested status (open)."]
+    assert analysis["context"][0]["evidence"] == [{"type": "ticket", "id": 2}]
+
+
+def test_second_account_is_searched_after_the_model_resolved_the_first(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(TWO_ACCOUNTS, [
+        call("search_accounts", {"query": "Northstar Labs"}, "a"),
+        call("get_account_tickets", {"account_id": 1}, "b"),
+        AIMessage(content="Ticket 1 is open with high priority."),
+        AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
+    ], client=client)
+    assert client.calls[2:] == [("search_accounts", {"query": "Bluebird Commerce"}),
+                                ("get_account_tickets", {"account_id": 2})]
+    assert _searches(client).count("Northstar Labs") == 1
+    assert _tickets(result) == SEEDED_TICKETS
+    assert result["tool_rounds"] == 4
+    assert result["limited"] is False
+
+
+def test_mixed_known_and_unknown_accounts_keep_the_valid_evidence(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(
+        "List open support tickets for Northstar Labs and Globex Corporation.",
+        [AIMessage(content="Both have tickets."),
+         AIMessage(content="Ticket 1 is open.")], client=client)
+    assert client.calls == [
+        ("search_accounts", {"query": "Northstar Labs"}),
+        ("search_accounts", {"query": "Globex Corporation"}),
+        ("get_account_tickets", {"account_id": 1}),
+    ]
+    assert list(_records(result, "account")) == [1]
+    assert _tickets(result) == {i: t for i, t in SEEDED_TICKETS.items() if t[0] == 1}
+    assert 'No account matched the search "Globex Corporation".' in result["answer"]
+    assert result["limited"] is False
+
+
+def test_unknown_account_is_a_clear_negative_result(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run("Investigate the login failures reported by Globex Corporation.",
+                            [AIMessage(content="They have SSO issues.")], client=client)
+    assert client.calls == [("search_accounts", {"query": "Globex Corporation"})]
+    assert result["evidence"] == []
+    assert result["answer_source"] == "evidence_summary"
+    assert 'No account matched the search "Globex Corporation".' in result["answer"]
+    assert result["limited"] is False
+
+
+ROBOTICS = {"name": "Northstar Robotics", "industry": "Hardware", "plan": "Business",
+            "status": "active"}
+
+
+def test_ambiguous_account_name_is_not_resolved_to_either_match(monkeypatch):
+    client = SeededMCP(monkeypatch, extra_accounts=[ROBOTICS])
+    result, client, _ = run("List the open tickets for Northstar.",
+                            [AIMessage(content="Ticket 1 is open.")], client=client)
+    assert client.calls == [("search_accounts", {"query": "Northstar"})]
+    assert result["limited"] is True
+    assert "Several accounts matched (1, 3)" in result["limited_reason"]
+
+
+def test_ambiguous_name_listed_with_a_known_account_only_gets_the_known_tickets(monkeypatch):
+    client = SeededMCP(monkeypatch, extra_accounts=[ROBOTICS])
+    result, client, _ = run("List open tickets for Northstar and Bluebird Commerce.",
+                            [AIMessage(content="Both have tickets.")], client=client)
+    assert client.calls == [
+        ("search_accounts", {"query": "Northstar"}),
+        ("search_accounts", {"query": "Bluebird Commerce"}),
+        ("get_account_tickets", {"account_id": 2}),
+    ]
+    assert _tickets(result) == {3: SEEDED_TICKETS[3]}
+    assert result["limited"] is True
+    assert 'The name "Northstar" matches several verified accounts (1, 3)' in (
+        result["limited_reason"])
+
+
+def test_repeated_identical_account_search_is_not_re_run(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    northstar = call("search_accounts", {"query": "Northstar Labs"}, "a")
+    result, client, _ = run(TWO_ACCOUNTS, [
+        northstar, northstar,
+        AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
+    ], client=client)
+    assert _searches(client) == ["Northstar Labs", "Bluebird Commerce"]
+    assert [e["origin"] for e in result["tool_trace"]] == ["model"] + ["orchestrator"] * 3
+    assert _tickets(result) == SEEDED_TICKETS
+    assert result["tool_rounds"] == 3
+    assert result["limited"] is False
+
+
+# Model turns that fail: invented account IDs, then invalid search arguments.
+FAILING_TURNS = [
+    AIMessage(content="", tool_calls=[
+        {"name": "get_account_tickets", "args": {"account_id": 101}, "id": "f1"},
+        {"name": "get_account_tickets", "args": {"account_id": 102}, "id": "f2"}]),
+    AIMessage(content="", tool_calls=[
+        {"name": "search_accounts", "args": {"name": "Northstar Labs"}, "id": "f3"},
+        {"name": "search_accounts", "args": {"name": "Bluebird Commerce"}, "id": "f4"}]),
+    call("get_account_tickets", {"account_id": 103}, "f5"),
+]
+
+
+@pytest.mark.parametrize("max_rounds, replies, rounds", [
+    # The last two rounds go to the required search -> tickets chain.
+    (4, FAILING_TURNS, 4),
+    # More budget: the model repeats its failed call, which counts as a stall.
+    (8, [*FAILING_TURNS, call("get_account_tickets", {"account_id": 103}, "f6")], 5),
+])
+def test_failed_model_calls_leave_rounds_for_both_accounts(
+        monkeypatch, max_rounds, replies, rounds):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run(TWO_ACCOUNTS, [
+        *replies, AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
+    ], client=client, max_rounds=max_rounds)
+    failed = [e for e in result["tool_trace"] if not e["success"]]
+    assert len(failed) == 5
+    assert [e["tool"] for e in result["tool_trace"] if e["origin"] == "orchestrator"] == [
+        "search_accounts", "search_accounts", "get_account_tickets", "get_account_tickets"]
+    assert len(client.calls) == len({(n, tuple(sorted(a.items()))) for n, a in client.calls})
+    assert _tickets(result) == SEEDED_TICKETS
+    assert result["tool_rounds"] == rounds
+    assert result["round_limit_reached"] is False
+    assert result["limited"] is False and result["limited_reason"] is None
+
+
+def test_too_many_listed_accounts_are_reported_not_truncated():
+    evidence = {"accounts": {}, "tickets": {}, "products": {}, "documents": {}}
+    plan = plan_evidence(
+        "Open tickets for Alpha One, Beta Two, Gamma Three and Delta Four?", evidence, [])
+    assert plan.calls == []
+    assert plan.gaps == ["The question names 4 accounts; at most 3 are investigated "
+                         "automatically. Name fewer accounts."]
+
+
+def test_shortened_name_listed_with_another_account_gets_its_tickets(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run("List open tickets for Northstar and Bluebird Commerce.",
+                            [AIMessage(content="Both have tickets."),
+                             AIMessage(content="Ticket 1 and Ticket 3 are open.")],
+                            client=client)
+    assert client.calls[:2] == [("search_accounts", {"query": "Northstar"}),
+                                ("search_accounts", {"query": "Bluebird Commerce"})]
+    assert sorted(args["account_id"] for _, args in client.calls[2:]) == [1, 2]
+    assert _tickets(result) == SEEDED_TICKETS
+    assert result["limited"] is False
+
+
+@pytest.mark.parametrize("question, names", [
+    ("Open tickets for Procter & Gamble and Northstar Labs?",
+     ["Procter & Gamble", "Northstar Labs"]),
+    ("Open tickets for Northstar Labs & Bluebird Commerce?",
+     ["Northstar Labs", "Bluebird Commerce"]),
+    ("List tickets for Northstar Labs, Bluebird Commerce.", ["Northstar Labs",
+                                                             "Bluebird Commerce"]),
+])
+def test_account_names_with_ampersands_and_lists(question, names):
+    assert account_references(question) == names
+
+
+class FailsOnce(SeededMCP):
+    """The first call of one tool fails, as a transient MCP error would."""
+
+    def __init__(self, monkeypatch, tool):
+        super().__init__(monkeypatch)
+        self.pending_failure = tool
+
+    async def call_tool(self, name, args):
+        if name != self.pending_failure:
+            return await super().call_tool(name, args)
+        self.pending_failure = None
+        self.calls.append((name, args))
+        text = f"Error executing tool {name}: Internal error while reading data"
+        return SimpleNamespace(isError=True, structuredContent=None,
+                               content=[SimpleNamespace(type="text", text=text)])
+
+
+def test_transient_search_failure_is_recovered_once_but_not_found_is_final(monkeypatch):
+    client = FailsOnce(monkeypatch, "search_accounts")
+    result, client, _ = run(
+        "List open support tickets for Northstar Labs and Globex Corporation.",
+        [call("search_accounts", {"query": "Northstar"}, "a"),
+         AIMessage(content="The search failed."),
+         AIMessage(content="Ticket 1 is open.")], client=client, max_rounds=8)
+    assert _searches(client) == ["Northstar", "Northstar Labs", "Globex Corporation"]
+    assert ("get_account_tickets", {"account_id": 1}) in client.calls
+    assert 'No account matched the search "Globex Corporation".' in result["answer"]
+    assert result["tool_rounds"] == 3
+    assert result["limited"] is False
+
+
+def test_single_account_model_keeps_control_when_it_searches_the_account(monkeypatch):
+    client = SeededMCP(monkeypatch)
+    result, client, _ = run("Investigate the open tickets for Northstar Labs.", [
+        call("search_knowledge", {"query": "login"}, "a"),
+        call("search_accounts", {"query": "Northstar Labs"}, "b"),
+        call("get_account_tickets", {"account_id": 1}, "c"),
+        AIMessage(content="Ticket 1 is open."),
+        AIMessage(content="Ticket 1 is open."),
+    ], client=client)
+    assert all(e["origin"] == "model" for e in result["tool_trace"])
+    assert result["tool_rounds"] == 3
     assert result["limited"] is False

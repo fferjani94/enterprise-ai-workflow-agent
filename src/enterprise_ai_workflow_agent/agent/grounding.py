@@ -14,6 +14,7 @@ GENERIC_TERMS = frozenset("""
 about account accounts across affect affected affecting all also and any are been before both
 but can cite check closed could customer customers data did does docs document documentation
 documents each every evidence find for from get give has have how into investigate investigation
+include includes including
 issue issues its latest list may more most not open our please priority problem problems recent
 related relevant report reported reports resolved results retrieve search see show some status
 support tell that the their them then there these they this those ticket tickets tool tools use
@@ -87,14 +88,18 @@ def _same_term(a: str, b: str) -> bool:
     return a == b or (min(len(a), len(b)) >= 4 and (a.startswith(b) or b.startswith(a)))
 
 
-def topic_terms(question: str, records: list[Record]) -> set[str]:
-    """Terms naming the investigated topic, excluding generic words and entity names."""
+def topic_terms(question: str, records: list[Record], names: tuple[str, ...] = ()) -> set[str]:
+    """Terms naming the investigated topic, excluding generic words and entity names.
+
+    `names` are further entity names that no retrieved record carries (an account the
+    question lists but that could not be verified).
+    """
     entity_names = {
         token
         for record in records
         if record["type"] in {"account", "product"}
         for token in _tokens(str(record.get("title") or ""))
-    }
+    } | {token for name in names for token in _tokens(name)}
     return {
         token for token in _tokens(question)
         if len(token) >= 3 and not token.isdigit()
@@ -115,7 +120,9 @@ def related_terms(terms: set[str]) -> dict[str, tuple[str, set[str]]]:
     return related
 
 
-def classify_relevance(question: str, records: list[Record]) -> list[Record]:
+def classify_relevance(
+    question: str, records: list[Record], names: tuple[str, ...] = ()
+) -> list[Record]:
     """Add 'relevance' and 'relevance_basis' labels to each evidence record (in place).
 
     context     account or product that identifies who/what was investigated
@@ -124,7 +131,7 @@ def classify_relevance(question: str, records: list[Record]) -> list[Record]:
     no_match    retrieved, but nothing in its retrieved fields matches the topic
     unassessed  the question names no specific topic
     """
-    terms = topic_terms(question, records)
+    terms = topic_terms(question, records, names)
     # With a specific topic in the question, symptom words alone are not enough.
     strong = {t for t in terms if t not in WEAK_TERMS}
     match_terms = strong or terms
@@ -185,23 +192,43 @@ def _detail(record: Record, keys: tuple[str, ...]) -> str:
     return f" ({detail})" if detail else ""
 
 
+# A status word directly qualifying the ticket noun ("open support tickets") is a filter.
+_STATUS_FILTER = re.compile(
+    r"\b(open|resolved|closed)\s+(?:support\s+)?(?:tickets?|incidents?|issues?|cases?)\b",
+    re.IGNORECASE,
+)
+_STATUS_VALUES = {"open": {"open"}, "resolved": {"resolved", "closed"},
+                  "closed": {"closed", "resolved"}}
+
+
+def requested_ticket_statuses(question: str) -> frozenset[str]:
+    """Ticket statuses the question explicitly asks for; empty when it sets no filter."""
+    return frozenset(value for word in _STATUS_FILTER.findall(question)
+                     for value in _STATUS_VALUES[word.lower()])
+
+
 def build_analysis(
     records: list[Record],
     *,
     expects_tickets: bool = False,
     issue_question: bool = False,
     notes: tuple[str, ...] = (),
+    ticket_statuses: frozenset[str] = frozenset(),
 ) -> dict[str, list[dict[str, Any]]]:
     """Deterministic answer sections built only from verified, labelled records.
 
     findings     relevant support tickets (or all tickets when relevance is unassessed)
     guidance     relevant knowledge documents: general documentation, not a diagnosis
-    context      accounts and products that identify what was investigated
+    context      accounts and products that identify what was investigated, and tickets
+                 outside the statuses the question asks for (ticket_statuses)
     unsupported  retrieved records with no topic match: not evidence of this issue
     unconfirmed  what the records do not establish, plus caller-supplied notes
     No model output is used, so record lists and counts here are authoritative.
     """
-    tickets = [r for r in records if r["type"] == "ticket"]
+    retrieved = [r for r in records if r["type"] == "ticket"]
+    other_status = [r for r in retrieved if ticket_statuses and str(
+        (r.get("fields") or {}).get("status") or "").casefold() not in ticket_statuses]
+    tickets = [r for r in retrieved if r not in other_status]
     documents = [r for r in records if r["type"] == "document"]
     findings, guidance, context, unsupported, unconfirmed = [], [], [], [], []
 
@@ -231,6 +258,11 @@ def build_analysis(
         findings.append(_statement(
             "No retrieved ticket matches the topic of the question.", *tickets
         ))
+    elif not tickets and other_status:
+        findings.append(_statement(
+            "No retrieved ticket has the requested status ("
+            + ", ".join(sorted(ticket_statuses)) + ").", *other_status,
+        ))
     elif not tickets and expects_tickets:
         findings.append(_statement("No support tickets were retrieved."))
 
@@ -250,6 +282,12 @@ def build_analysis(
             + (f", \"{title}\"" if title else " (details not retrieved)")
             + _detail(record, ("plan", "industry", "status", "version"))
             + ": context for the investigation, not evidence of the issue.", record,
+        ))
+    for ticket in other_status:
+        context.append(_statement(
+            f"Ticket {ticket['id']}, \"{ticket.get('title') or 'untitled'}\""
+            f"{_detail(ticket, ('status', 'priority'))}, was retrieved but does not have "
+            "the status the question asks for.", ticket,
         ))
     for ticket in (r for r in tickets if r["relevance"] == "no_match"):
         unsupported.append(_statement(

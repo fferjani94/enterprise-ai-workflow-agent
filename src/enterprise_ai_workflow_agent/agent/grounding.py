@@ -5,7 +5,14 @@ term with the topic of the question. Matching is lexical and deliberately conser
 """
 
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
+
+from enterprise_ai_workflow_agent.mcp_server.services import (
+    TICKET_STATUS_VALUES,
+    ticket_status_matches,
+)
 
 TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -194,17 +201,66 @@ def _detail(record: Record, keys: tuple[str, ...]) -> str:
 
 # A status word directly qualifying the ticket noun ("open support tickets") is a filter.
 _STATUS_FILTER = re.compile(
-    r"\b(open|resolved|closed)\s+(?:support\s+)?(?:tickets?|incidents?|issues?|cases?)\b",
+    r"\b(open|resolved|closed|unresolved)\s+(?:support\s+)?(?:tickets?|incidents?|issues?"
+    r"|cases?)\b",
     re.IGNORECASE,
 )
-_STATUS_VALUES = {"open": {"open"}, "resolved": {"resolved", "closed"},
-                  "closed": {"closed", "resolved"}}
 
 
 def requested_ticket_statuses(question: str) -> frozenset[str]:
     """Ticket statuses the question explicitly asks for; empty when it sets no filter."""
     return frozenset(value for word in _STATUS_FILTER.findall(question)
-                     for value in _STATUS_VALUES[word.lower()])
+                     for value in TICKET_STATUS_VALUES[word.lower()])
+
+
+COMPLETE, PARTIAL, FAILED, UNRETRIEVED = "complete", "partial", "failed", "unretrieved"
+
+
+@dataclass(frozen=True)
+class TicketCoverage:
+    """How completely one account's tickets matching one status filter were retrieved."""
+    account_id: int
+    account_name: str | None
+    status_filter: tuple[str, ...]  # canonical statuses; empty means all statuses
+    state: str  # COMPLETE, PARTIAL, FAILED or UNRETRIEVED
+    total: int | None  # SQL total of matching tickets, when known
+    retrieved: int  # unique matching tickets retrieved
+    next_offset: int | None = None  # first offset not yet retrieved, while incomplete
+    pages: int = 0  # successful orchestrator page requests for this filter
+
+
+def status_label(status_filter: Sequence[str]) -> str:
+    """'open ', 'resolved or closed ', ... for use before the word 'tickets'."""
+    values = set(status_filter)
+    if not values:
+        return ""
+    if values == {"closed", "resolved"}:
+        return "resolved or closed "
+    return " or ".join(sorted(values)) + " "
+
+
+def _tickets(count: int) -> str:
+    return "ticket" if count == 1 else "tickets"
+
+
+def coverage_statement(coverage: TicketCoverage) -> str:
+    who = (f"{coverage.account_name} (Account {coverage.account_id})"
+           if coverage.account_name else f"Account {coverage.account_id}")
+    label = status_label(coverage.status_filter)
+    if coverage.state == COMPLETE:
+        total = coverage.total or 0
+        if not total:
+            return f"{who}: 0 {label}tickets (complete)."
+        return f"{who}: {total} {label}{_tickets(total)} retrieved (complete)."
+    if coverage.state == PARTIAL:
+        if coverage.total is not None:
+            return (f"{who}: {coverage.retrieved} of {coverage.total} {label}"
+                    f"{_tickets(coverage.total)} retrieved; detailed list incomplete.")
+        return (f"{who}: {coverage.retrieved} {label}{_tickets(coverage.retrieved)} "
+                "retrieved; total unknown, detailed list incomplete.")
+    if coverage.state == FAILED:
+        return f"{who}: ticket retrieval failed; ticket count unknown."
+    return f"{who}: tickets not retrieved; ticket count unknown."
 
 
 def build_analysis(
@@ -214,10 +270,12 @@ def build_analysis(
     issue_question: bool = False,
     notes: tuple[str, ...] = (),
     ticket_statuses: frozenset[str] = frozenset(),
+    coverage: Sequence[TicketCoverage] = (),
 ) -> dict[str, list[dict[str, Any]]]:
     """Deterministic answer sections built only from verified, labelled records.
 
-    findings     relevant support tickets (or all tickets when relevance is unassessed)
+    findings     per-account ticket coverage, then relevant support tickets (or all tickets
+                 when relevance is unassessed)
     guidance     relevant knowledge documents: general documentation, not a diagnosis
     context      accounts and products that identify what was investigated, and tickets
                  outside the statuses the question asks for (ticket_statuses)
@@ -226,11 +284,16 @@ def build_analysis(
     No model output is used, so record lists and counts here are authoritative.
     """
     retrieved = [r for r in records if r["type"] == "ticket"]
-    other_status = [r for r in retrieved if ticket_statuses and str(
-        (r.get("fields") or {}).get("status") or "").casefold() not in ticket_statuses]
+    other_status = [r for r in retrieved if not ticket_status_matches(
+        (r.get("fields") or {}).get("status"), ticket_statuses)]
     tickets = [r for r in retrieved if r not in other_status]
     documents = [r for r in records if r["type"] == "document"]
     findings, guidance, context, unsupported, unconfirmed = [], [], [], [], []
+
+    accounts = {r["id"]: r for r in records if r["type"] == "account"}
+    for item in coverage:
+        account = accounts.get(item.account_id)
+        findings.append(_statement(coverage_statement(item), *([account] if account else [])))
 
     matching = [r for r in tickets if r["relevance"] == "relevant"]
     for ticket in matching:
@@ -469,8 +532,110 @@ _RELEVANCE_CLAIM = re.compile(
 )
 
 
-def miscounted_records(text: str, records: list[Record]) -> list[str]:
-    """Count claims ("two support tickets ...") that no grouping of the records supports."""
+# Wording attached to a count that presents it as what was retrieved, not what exists:
+# "20 tickets (were) retrieved" after the count, or "the first 20 tickets" before it.
+_RETRIEVED_AFTER = re.compile(  # used with .match(text, pos), which anchors at pos
+    r"\s*(?:(?:were|was|have been|has been|are|is)\s+)?"
+    r"(?:retrieved|shown|listed|returned|displayed|fetched)\b",
+    re.IGNORECASE)
+_RETRIEVED_BEFORE = re.compile(r"\bfirst\s+$", re.IGNORECASE)
+# Names listed together ("X and Y", "X, Y", "X & Y") form one combined subject.
+_NAME_JOIN = re.compile(r"^\s*(?:,|,?\s*and|&)\s*$", re.IGNORECASE)
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    left = max(text.rfind(mark, 0, start) for mark in (". ", "! ", "? ", "\n")) + 1
+    right = min((i for i in (text.find(mark, end) for mark in (". ", "! ", "? ", "\n"))
+                 if i != -1), default=len(text))
+    return left, right
+
+
+def _sentence_at(text: str, start: int, end: int) -> str:
+    left, right = _sentence_bounds(text, start, end)
+    return text[left:right]
+
+
+def _account_mentions(
+    sentence: str, coverage: Sequence[TicketCoverage]
+) -> list[tuple[int, int, TicketCoverage]]:
+    mentions = []
+    for item in coverage:
+        patterns = [rf"\baccount\s*(?:id\s*)?[:#]?\s*{item.account_id}\b"]
+        if item.account_name:
+            patterns.append(r"\b" + r"\s+".join(map(re.escape, item.account_name.split()))
+                            + r"\b")
+        for pattern in patterns:
+            mentions += [(m.start(), m.end(), item)
+                         for m in re.finditer(pattern, sentence, re.IGNORECASE)]
+    return sorted(mentions, key=lambda m: m[0])
+
+
+def _count_subject(
+    text: str, start: int, end: int, coverage: Sequence[TicketCoverage]
+) -> list[TicketCoverage]:
+    """The account(s) a count is about: the nearest name before it (with names listed
+    together with it), else the first name after it, else every investigated account."""
+    left, right = _sentence_bounds(text, start, end)
+    sentence = text[left:right]
+    mentions = _account_mentions(sentence, coverage)
+    before = [m for m in mentions if m[1] <= start - left][::-1]
+    after = [m for m in mentions if m[0] >= end - left]
+    chain = before or after
+    if not chain:
+        return list(coverage)
+    group = [chain[0]]
+    for mention in chain[1:]:
+        first, second = (mention, group[-1]) if before else (group[-1], mention)
+        if first[1] <= second[0] and _NAME_JOIN.match(sentence[first[1]:second[0]]):
+            group.append(mention)
+        elif mention[2] is not group[-1][2]:
+            break
+    return list({id(m[2]): m[2] for m in group}.values())
+
+
+def _group_counts(records: list[Record]) -> set[int]:
+    """Counts supported by some grouping of the records (all, relevance, status, priority)."""
+    return {len(records)} | {
+        sum(1 for r in records if r["relevance"] == label)
+        for label in ("relevant", "no_match", "unassessed")
+    } | {
+        sum(1 for r in records if (r.get("fields") or {}).get(field) == value)
+        for r0 in records for field, value in (r0.get("fields") or {}).items()
+        if field in {"status", "priority"}
+    }
+
+
+def _ticket_counts(
+    text: str, match: re.Match[str], tickets: list[Record],
+    coverage: Sequence[TicketCoverage],
+) -> set[int]:
+    """Ticket counts a claim may state, scoped to the account(s) it is about.
+
+    Several accounts listed together only support their combined total. Retrieved
+    counts are valid when the accounts' tickets are complete or the count is worded as
+    retrieved ("20 tickets retrieved", "the first 20 tickets").
+    """
+    about = _count_subject(text, match.start(), match.end(), coverage)
+    totals = [c.total for c in about]
+    allowed = set() if None in totals else {sum(totals)}
+    qualified = (_RETRIEVED_AFTER.match(text, match.end())
+                 or _RETRIEVED_BEFORE.search(text[:match.start()]))
+    if qualified or all(c.state == COMPLETE for c in about):
+        ids = {c.account_id for c in about}
+        scoped = (tickets if len(about) == len(coverage) else
+                  [r for r in tickets if (r.get("fields") or {}).get("account_id") in ids])
+        allowed |= _group_counts(scoped)
+    return allowed
+
+
+def miscounted_records(
+    text: str, records: list[Record], coverage: Sequence[TicketCoverage] = ()
+) -> list[str]:
+    """Count claims ("two support tickets ...") that no grouping of the records supports.
+
+    With ticket coverage, ticket counts are checked per account against SQL totals and,
+    where valid, the retrieved records (see _ticket_counts).
+    """
     problems = []
     for match in _COUNT_CLAIM.finditer(text):
         if _ID_PREFIX.search(text[:match.start()]):
@@ -486,16 +651,98 @@ def miscounted_records(text: str, records: list[Record]) -> list[str]:
             if count != relevant:
                 problems.append(f"{number} {noun}")
             continue
-        allowed = {len(same), relevant} | {
-            sum(1 for r in same if r["relevance"] == label)
-            for label in ("relevant", "no_match", "unassessed")
-        } | {
-            sum(1 for r in same if (r.get("fields") or {}).get(field) == value)
-            for r0 in same for field, value in (r0.get("fields") or {}).items()
-            if field in {"status", "priority"}
-        }
+        if kind == "ticket" and coverage:
+            allowed = _ticket_counts(text, match, same, coverage)
+        else:
+            allowed = {relevant} | _group_counts(same)
         if count not in allowed:
             problems.append(f"{number} {noun}")
+    return problems
+
+
+_COMPLETENESS_CLAIM = re.compile(
+    r"\b(?:these|those|here|this|that) (?:are|is) (?:all|every)\b"
+    r"|\ball (?:of )?(?:the |their |its |his |her )?(?:[a-z-]+ ){0,2}tickets\b"
+    r"|\bevery (?:[a-z-]+ ){0,2}ticket\b"
+    r"|\b(?:complete|full|entire|exhaustive) (?:ticket )?(?:list|set|picture|overview)\b"
+    r"|\bfully (?:investigated|retrieved|reviewed|covered|checked)\b"
+    r"|\b(?:no|not any) (?:other|additional|further|more|remaining) (?:[a-z-]+ ){0,2}tickets\b"
+    r"|\binvestigation (?:is|was|has been) (?:now )?(?:complete|completed|finished|done)\b"
+    r"|\b(?:all|both|each|every) (?:of the )?(?:requested |named |listed )?accounts? "
+    r"(?:were|was|have been|has been|are|is) (?:all )?(?:fully )?"
+    r"(?:investigated|checked|reviewed|covered|retrieved)\b",
+    re.IGNORECASE,
+)
+# A negation directly before the claim ("not a complete list", "Not all tickets").
+_NEGATED_CLAIM = re.compile(
+    r"(?:\bnot|n't|\bnever)\s+(?:(?:a|an|the|yet|quite|necessarily)\s+)?$", re.IGNORECASE)
+_NO_TICKETS = re.compile(
+    r"\b(?:no|not any|zero)\b(?!\s+(?:other|additional|further|more)\b)"
+    r".{0,65}\b(?:tickets|support tickets)\b"
+    r"|\b(?:tickets|support tickets)\b.{0,65}\b(?:none|not found)\b",
+    re.IGNORECASE,
+)
+_STATUS_WORD = re.compile(r"\b(open|resolved|closed|unresolved)\b", re.IGNORECASE)
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for line in text.splitlines() for s in re.split(r"(?<=[.!?])\s+", line)
+            if s.strip()]
+
+
+def _named(text: str, coverage: Sequence[TicketCoverage]) -> list[TicketCoverage]:
+    folded = " ".join(text.split()).casefold()
+    return [c for c in coverage
+            if (c.account_name and " ".join(c.account_name.split()).casefold() in folded)
+            or re.search(rf"\baccount\s*(?:id\s*)?[:#]?\s*{c.account_id}\b", text, re.I)]
+
+
+def unsupported_completeness_claims(
+    text: str, coverage: Sequence[TicketCoverage], outstanding: bool = False
+) -> list[str]:
+    """Claims that the tickets or the investigation are complete when they are not.
+
+    Checked while any account's tickets are incomplete, or while the investigation has
+    outstanding gaps or lookups (`outstanding`). Only a negation directly before the
+    claim ("not a complete list") disarms it.
+    """
+    if not outstanding and all(c.state == COMPLETE for c in coverage):
+        return []
+    return [match.group(0) for sentence in _sentences(text)
+            for match in _COMPLETENESS_CLAIM.finditer(sentence)
+            if not _NEGATED_CLAIM.search(sentence[:match.start()])]
+
+
+def _supports_no_tickets(coverage: TicketCoverage, claimed: frozenset[str]) -> bool:
+    """Whether a complete zero result covers every status the claim is about.
+
+    A claim naming no status ("no tickets") needs an unfiltered zero total.
+    """
+    if coverage.state != COMPLETE or coverage.total:
+        return False
+    return not coverage.status_filter or (
+        bool(claimed) and claimed <= set(coverage.status_filter))
+
+
+def unsupported_no_ticket_claims(
+    text: str, coverage: Sequence[TicketCoverage]
+) -> list[str]:
+    """"No tickets" claims about an account whose zero total is not established.
+
+    A claim is checked against the accounts its clause names, else those its sentence
+    names, else every investigated account. Only a complete retrieval with a total of
+    zero for every status the claim covers supports it.
+    """
+    problems = []
+    for sentence in _sentences(text):
+        for clause in re.split(r"[,;]|\b(?:while|but|whereas|although)\b", sentence):
+            if not _NO_TICKETS.search(clause):
+                continue
+            claimed = frozenset(value for word in _STATUS_WORD.findall(clause)
+                                for value in TICKET_STATUS_VALUES[word.lower()])
+            about = _named(clause, coverage) or _named(sentence, coverage) or list(coverage)
+            if not all(_supports_no_tickets(c, claimed) for c in about):
+                problems.append(clause.strip())
     return problems
 
 

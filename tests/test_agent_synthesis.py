@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, SystemMessage
+from ticket_pages import ticket_page
 
 from enterprise_ai_workflow_agent.agent.graph import investigate
 from enterprise_ai_workflow_agent.agent.grounding import (
@@ -36,7 +37,7 @@ TOOLS = [
     SimpleNamespace(name="get_account_tickets", description="", inputSchema={
         "type": "object", "properties": {"account_id": {"type": "integer"},
                                          "limit": {"type": "integer", "minimum": 1,
-                                                   "maximum": 20}}}),
+                                                   "maximum": 50}}}),
     SimpleNamespace(name="search_knowledge", description="", inputSchema={
         "type": "object", "properties": {"query": {"type": "string"}}}),
 ]
@@ -81,7 +82,9 @@ class FakeMCP:
 
     async def call_tool(self, name, args):
         self.calls.append((name, args))
-        return SimpleNamespace(isError=False, structuredContent={"result": self.data[name]},
+        result = (ticket_page(self.data[name], args) if name == "get_account_tickets"
+                  else self.data[name])
+        return SimpleNamespace(isError=False, structuredContent={"result": result},
                                content=[])
 
 
@@ -309,7 +312,7 @@ def test_last_round_fetches_required_tickets_instead_of_ending_incomplete():
     ]
     result, model, client = run(looping_without_tickets, [AIMessage(content=GOOD_SYNTHESIS)],
                                 max_rounds=2)
-    assert ("get_account_tickets", {"account_id": 1}) in client.calls
+    assert ("get_account_tickets", {"account_id": 1, "limit": 50}) in client.calls
     assert result["limited"] is False
     assert result["answer_source"] == "synthesis"
 

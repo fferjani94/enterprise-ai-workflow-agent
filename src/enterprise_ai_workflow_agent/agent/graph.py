@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from dataclasses import asdict
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import (
@@ -18,16 +19,21 @@ from langgraph.graph import END, START, StateGraph, add_messages
 from enterprise_ai_workflow_agent.agent.followups import (
     FollowUp,
     classify_intent,
+    parse_ticket_page,
     plan_evidence,
     search_covers,
+    ticket_call_covers,
+    ticket_coverage_report,
     unresolved_listed_accounts,
 )
 from enterprise_ai_workflow_agent.agent.grounding import (
     CAUSAL_NOTE,
     FIX_CLAIM_NOTE,
     UNCITED_GUIDANCE_NOTE,
+    TicketCoverage,
     build_analysis,
     classify_relevance,
+    coverage_statement,
     has_causal_claim,
     miscounted_records,
     qualify_fix_claims,
@@ -35,6 +41,8 @@ from enterprise_ai_workflow_agent.agent.grounding import (
     render_sections,
     requested_ticket_statuses,
     unrelated_mentions,
+    unsupported_completeness_claims,
+    unsupported_no_ticket_claims,
 )
 from enterprise_ai_workflow_agent.agent.synthesis import SYNTHESIS_PROMPT, synthesis_input
 
@@ -241,6 +249,8 @@ def _extract_records(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         if payload.get("found") is False:
             return []
+        if isinstance(payload.get("tickets"), list):  # a get_account_tickets page
+            return _extract_records(payload["tickets"])
         if "result" in payload:
             return _extract_records(payload["result"])
         if isinstance(payload.get("id"), int) and not isinstance(payload["id"], bool):
@@ -276,16 +286,19 @@ _CITED_ID = re.compile(
 )
 
 
-def _unsupported_final(answer: str, evidence: dict[str, Any]) -> bool:
+def _unsupported_final(
+    answer: str, evidence: dict[str, Any], coverage: list[TicketCoverage] | None = None
+) -> bool:
     """Catch common unsupported ID and negative-evidence claims.
 
     A cited ID must belong to a retrieved record of the same type: "Ticket 1" is not
     supported by Document 1. This is a conservative guard, not a general fact checker.
+    With ticket coverage, "no tickets" claims are checked per account instead.
     """
     for kind, number in _CITED_ID.findall(answer):
         if int(number) not in evidence[f"{kind.lower()}s"]:
             return True
-    if evidence["tickets"] and re.search(
+    if not coverage and evidence["tickets"] and re.search(
         r"\b(?:no|not any|zero)\b(?!\s+(?:other|additional|further|more)\b)"
         r".{0,65}\b(?:tickets|support tickets)\b"
         r"|\b(?:tickets|support tickets)\b.{0,65}\b(?:none|not found)\b",
@@ -321,15 +334,26 @@ def _labelled_records(
 
 
 def _answer_problem(
-    answer: str, evidence: dict[str, Any], records: list[dict[str, Any]]
+    answer: str, evidence: dict[str, Any], records: list[dict[str, Any]],
+    coverage: list[TicketCoverage] | None = None, outstanding: bool = False,
 ) -> str | None:
-    """Why an answer must not be shown, or None if it passes the grounding checks."""
-    if _unsupported_final(answer, evidence):
+    """Why an answer must not be shown, or None if it passes the grounding checks.
+
+    `outstanding`: the investigation still has gaps or required lookups.
+    """
+    coverage = coverage or []
+    if _unsupported_final(answer, evidence, coverage):
         return "it contained an unsupported ID or contradicted retrieved evidence"
+    if unsupported_no_ticket_claims(answer, coverage):
+        return ("it stated that an account has no tickets although ticket retrieval did not "
+                "establish that")
+    if unsupported_completeness_claims(answer, coverage, outstanding):
+        return ("it presented the tickets or the investigation as complete although the "
+                "investigation is incomplete")
     if unrelated_mentions(answer, records):
         return ("it described records as related to the investigation without supporting "
                 "evidence")
-    if miscounted := miscounted_records(answer, records):
+    if miscounted := miscounted_records(answer, records, coverage):
         return ("it stated a record count that the retrieved records do not support ("
                 + ", ".join(miscounted) + ")")
     return None
@@ -431,6 +455,7 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             normalized_args = args
             adjustments: list[str] = []
             count = 0
+            page = None
             if name not in tool_names:
                 payload = {"error": f"Unknown tool: {name}"}
                 ok = False
@@ -482,6 +507,9 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                                     if getattr(item, "type", "") == "text"
                                 ]
                             count = _record_evidence(evidence, name, payload)
+                            if name == "get_account_tickets":
+                                page = parse_ticket_page(payload,
+                                                         normalized_args.get("account_id"))
                             succeeded.add(_call_key(name, normalized_args))
                             ok = True
                     except Exception as exc:
@@ -504,6 +532,9 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             }
             if call["id"] in followup_reasons:
                 entry["reason"] = followup_reasons[call["id"]]
+            if page is not None:
+                # Taken from the full payload, so result truncation below cannot affect it.
+                entry["page"] = page
             if adjustments:
                 entry["adjustments"] = adjustments
             if not ok:
@@ -539,16 +570,19 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             _call_key(entry["tool"], entry.get("normalized_arguments"))
             for entry in state["tool_trace"]
         }
+        # Planned arguments are compared as executed: a schema may clamp them (page size).
         return [
             call for call in plan.calls
-            if call.tool in tool_names and _call_key(call.tool, call.arguments) not in attempted
+            if call.tool in tool_names and _call_key(
+                call.tool, prepare_arguments(call.tool, call.arguments)[0]) not in attempted
         ][:MAX_TOOL_CALLS_PER_ROUND]
 
     def uncovered_followups(state: AgentState) -> list[FollowUp]:
         """Required lookups that the model's pending tool request does not already cover.
 
         Coverage follows what the plan needs: an account search whose query covers the
-        planned name, any knowledge search, or tickets for the same account. A call that
+        planned name, any knowledge search, or the same ticket page (account, status filter
+        and offset) with at least the planned page size. A call that
         repeats an earlier attempt covers nothing: it is skipped as a duplicate or fails
         again the same way.
         """
@@ -564,7 +598,7 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             if name != item.tool:
                 return False
             if item.tool == "get_account_tickets":
-                return args.get("account_id") == item.arguments["account_id"]
+                return ticket_call_covers(args, item.arguments)
             if item.tool == "search_accounts":
                 return search_covers(args.get("query"), item.arguments["query"])
             return True
@@ -614,7 +648,10 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
         plan = plan_evidence(state["question"], state["evidence"], state["tool_trace"])
         if not (plan.gaps or plan.calls):
             return "synthesize"
-        if _answer_problem(str(latest.content), state["evidence"], records):
+        coverage = ticket_coverage_report(state["question"], state["evidence"],
+                                          state["tool_trace"])
+        if _answer_problem(str(latest.content), state["evidence"], records, coverage,
+                           outstanding=True):
             return "synthesize"
         return "done"
 
@@ -646,7 +683,8 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
              "id": f"{ORCHESTRATOR_CALL_PREFIX}{round_number}-{index}"}
             for index, item in enumerate(pending)
         ]
-        planned = {_call_key(item.tool, item.arguments) for item in pending}
+        planned = {_call_key(item.tool, prepare_arguments(item.tool, item.arguments)[0])
+                   for item in pending}
         attempted = attempted_keys(state)
         model_calls = [
             call for call in (getattr(latest, "tool_calls", None) or [])
@@ -688,7 +726,10 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                     "answer_notice": ("Required evidence is missing, so no conclusion was "
                                       "generated." if records else None)}
         messages = [SystemMessage(content=SYNTHESIS_PROMPT),
-                    HumanMessage(content=synthesis_input(state["question"], records))]
+                    HumanMessage(content=synthesis_input(
+                        state["question"], records,
+                        [coverage_statement(c) for c in ticket_coverage_report(
+                            state["question"], state["evidence"], state["tool_trace"])]))]
         # The unbound model: no tool specs are sent, so no tool can be requested.
         reply, failure = await _invoke_with_retries(
             model, [messages] * MODEL_ATTEMPTS, "synthesis")
@@ -754,6 +795,7 @@ async def investigate(
     )
     evidence = result["evidence"]
     records = _labelled_records(question, evidence, result["tool_trace"])
+    coverage = ticket_coverage_report(question, evidence, result["tool_trace"])
     limited_reason = _limited_reason(question, result, max_rounds)
     intent = classify_intent(question)
     analysis = build_analysis(
@@ -762,6 +804,7 @@ async def investigate(
         issue_question=intent.tickets or intent.knowledge,
         notes=_unmatched_account_searches(result["tool_trace"], evidence),
         ticket_statuses=requested_ticket_statuses(question),
+        coverage=coverage,
     )
     sections = render_sections(analysis)
     source, notice = result["answer_source"], result["answer_notice"]
@@ -775,7 +818,8 @@ async def investigate(
         if source != ANSWER_FROM_EVIDENCE:
             # The same checks apply to every model-written narrative: the tool loop's
             # answer, a synthesis, or a synthesis after the round limit.
-            narrative, problem = _ground_narrative(answer, evidence, records)
+            narrative, problem = _ground_narrative(answer, evidence, records, coverage,
+                                                   outstanding=limited_reason is not None)
             if problem:
                 logger.warning("Final answer withheld because %s: %.300r", problem, answer)
                 source = ANSWER_FROM_EVIDENCE
@@ -795,6 +839,7 @@ async def investigate(
         "tool_trace": result["tool_trace"],
         "evidence": records,
         "analysis": analysis,
+        "ticket_coverage": [asdict(item) for item in coverage],
         "limited": limited_reason is not None,
         "limited_reason": limited_reason,
         "model_error": result["model_error"],
@@ -802,10 +847,11 @@ async def investigate(
 
 
 def _ground_narrative(
-    answer: str, evidence: dict[str, Any], records: list[dict[str, Any]]
+    answer: str, evidence: dict[str, Any], records: list[dict[str, Any]],
+    coverage: list[TicketCoverage] | None = None, outstanding: bool = False,
 ) -> tuple[str, str | None]:
     """(narrative, problem): the cleaned narrative, or why it must be withheld."""
-    if problem := _answer_problem(answer, evidence, records):
+    if problem := _answer_problem(answer, evidence, records, coverage, outstanding):
         return "", problem
     narrative, removed = remove_uncited_guidance(answer, records)
     if removed:
@@ -821,6 +867,9 @@ def _ground_narrative(
         narrative += "\n\n" + FIX_CLAIM_NOTE
     if has_causal_claim(narrative):
         narrative += CAUSAL_NOTE
+    # The displayed text is checked again, after the edits above.
+    if problem := _answer_problem(narrative, evidence, records, coverage, outstanding):
+        return "", problem
     return narrative, None
 
 

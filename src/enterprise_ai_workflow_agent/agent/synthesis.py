@@ -54,10 +54,18 @@ def describe_record(record: dict[str, Any]) -> str:
     return line
 
 
-def synthesis_input(question: str, records: list[dict[str, Any]]) -> str:
+def synthesis_input(
+    question: str, records: list[dict[str, Any]], coverage: list[str] | None = None
+) -> str:
     """A compact, grouped view of the verified evidence for the synthesis prompt."""
-    lines = [f"Question: {question.strip()}", "", "Verified records:"]
-    selected = records[:MAX_SYNTHESIS_RECORDS]
+    lines = [f"Question: {question.strip()}", ""]
+    if coverage:
+        lines += ["TICKET COVERAGE (authoritative; never call a ticket list complete unless "
+                  "it says complete, and use only these ticket totals):",
+                  *(f"- {line}" for line in coverage), ""]
+    lines.append("Verified records:")
+    # Context records (accounts, products) are the first to be left out.
+    selected = sorted(records, key=lambda r: r["relevance"] == "context")[:MAX_SYNTHESIS_RECORDS]
     for heading, belongs in _GROUPS:
         items = [describe_record(r) for r in selected if belongs(r)]
         if items:

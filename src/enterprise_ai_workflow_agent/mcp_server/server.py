@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -20,6 +20,13 @@ Limit = Annotated[
     Field(ge=1, le=services.MAX_RESULTS,
           description=f"Maximum number of results, 1-{services.MAX_RESULTS}."),
 ]
+TicketLimit = Annotated[
+    int,
+    Field(ge=1, le=services.TICKET_MAX_RESULTS,
+          description=f"Page size, 1-{services.TICKET_MAX_RESULTS}."),
+]
+Offset = Annotated[int, Field(ge=0, description="Number of matching tickets to skip.")]
+TicketStatus = Literal["open", "resolved", "closed", "unresolved"]
 
 
 def _run(operation: Callable[..., Any], *args: Any) -> Any:
@@ -44,9 +51,15 @@ def search_accounts(query: str, limit: Limit = 10) -> list[dict]:
 
 
 @mcp.tool()
-def get_account_tickets(account_id: int, limit: Limit = 10) -> list[dict]:
-    """List support tickets for a customer account (read-only)."""
-    return _run(services.get_account_tickets, account_id, limit)
+def get_account_tickets(
+    account_id: int,
+    status: TicketStatus | list[TicketStatus] | None = None,
+    limit: TicketLimit = 10,
+    offset: Offset = 0,
+) -> dict[str, Any]:
+    """List one page of support tickets for a customer account, ordered by ticket ID
+    (not by date), with the total number of matching tickets (read-only)."""
+    return _run(services.get_account_tickets, account_id, status, limit, offset)
 
 
 @mcp.tool()

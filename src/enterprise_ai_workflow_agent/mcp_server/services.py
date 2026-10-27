@@ -1,6 +1,8 @@
 import re
+from collections.abc import Iterable
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from enterprise_ai_workflow_agent.db.models import (
@@ -11,6 +13,13 @@ from enterprise_ai_workflow_agent.db.models import (
 )
 
 MAX_RESULTS = 20
+TICKET_MAX_RESULTS = 50
+# Requested status -> stored statuses it selects. "unresolved" means not resolved/closed.
+TICKET_STATUS_VALUES = {
+    "open": ("open",), "resolved": ("closed", "resolved"),
+    "closed": ("closed", "resolved"), "unresolved": ("unresolved",),
+}
+FINISHED_STATUSES = ("closed", "resolved")
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {"a", "an", "and", "are", "for", "how", "in", "is", "of",
              "on", "or", "the", "to", "what", "with"}
@@ -42,16 +51,63 @@ def search_accounts(db: Session, query: str, limit: int = 10) -> list[dict]:
              "plan": a.plan, "status": a.status} for a in rows]
 
 
-def get_account_tickets(db: Session, account_id: int, limit: int = 10) -> list[dict]:
+def ticket_status_filter(status: str | Iterable[str] | None) -> list[str]:
+    """Canonical, sorted status filter for a requested status (or list); [] means all."""
+    if status is None:
+        return []
+    requested = [status] if isinstance(status, str) else list(status)
+    values: set[str] = set()
+    for item in requested:
+        key = str(item).strip().lower()
+        if key not in TICKET_STATUS_VALUES:
+            raise ValueError("status must be one of: " + ", ".join(TICKET_STATUS_VALUES))
+        values.update(TICKET_STATUS_VALUES[key])
+    return sorted(values)
+
+
+def ticket_status_matches(status: Any, status_filter: Iterable[str]) -> bool:
+    """Whether a stored ticket status is selected by a canonical status filter."""
+    wanted = set(status_filter)
+    if not wanted:
+        return True
+    value = str(status or "").strip().lower()
+    return value in wanted or ("unresolved" in wanted and value not in FINISHED_STATUSES)
+
+
+def get_account_tickets(
+    db: Session, account_id: int, status: str | list[str] | None = None,
+    limit: int = 10, offset: int = 0,
+) -> dict[str, Any]:
+    """One page of an account's tickets, ordered by ticket ID, with the SQL total."""
+    if not 1 <= limit <= TICKET_MAX_RESULTS:
+        raise ValueError(f"limit must be between 1 and {TICKET_MAX_RESULTS}")
+    if offset < 0:
+        raise ValueError("offset must be 0 or greater")
+    status_filter = ticket_status_filter(status)
+    predicates = [Ticket.account_id == account_id]
+    if status_filter:
+        stored = func.lower(func.trim(Ticket.status))
+        selected = [v for v in status_filter if v != "unresolved"]
+        clauses = [stored.in_(selected)] if selected else []
+        if "unresolved" in status_filter:
+            clauses.append(stored.not_in(FINISHED_STATUSES))
+        predicates.append(or_(*clauses))
+    total = db.scalar(select(func.count()).select_from(Ticket).where(*predicates)) or 0
     rows = db.scalars(
-        select(Ticket)
-        .where(Ticket.account_id == account_id)
-        .order_by(Ticket.id)
-        .limit(_limit(limit))
+        select(Ticket).where(*predicates).order_by(Ticket.id).offset(offset).limit(limit)
     ).all()
-    return [{"id": t.id, "account_id": t.account_id, "product_id": t.product_id,
+    has_more = offset + len(rows) < total
+    # Metadata precedes the records so it survives truncation of the serialized result.
+    return {
+        "account_id": account_id, "status_filter": status_filter, "order": "ticket_id",
+        "total": total, "offset": offset, "limit": limit, "returned": len(rows),
+        "has_more": has_more, "next_offset": offset + len(rows) if has_more else None,
+        "tickets": [
+            {"id": t.id, "account_id": t.account_id, "product_id": t.product_id,
              "subject": t.subject, "status": t.status, "priority": t.priority}
-            for t in rows]
+            for t in rows
+        ],
+    }
 
 
 def get_ticket_details(db: Session, ticket_id: int) -> dict:

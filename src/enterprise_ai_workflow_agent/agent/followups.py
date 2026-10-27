@@ -25,14 +25,39 @@ Account IDs still come only from MCP results. Several unlisted capitalised phras
 guessed between.
 """
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from enterprise_ai_workflow_agent.agent.grounding import topic_terms
+from enterprise_ai_workflow_agent.agent.grounding import (
+    COMPLETE,
+    PARTIAL,
+    UNRETRIEVED,
+    TicketCoverage,
+    requested_ticket_statuses,
+    status_label,
+    topic_terms,
+)
+from enterprise_ai_workflow_agent.agent.grounding import FAILED as RETRIEVAL_FAILED
+from enterprise_ai_workflow_agent.mcp_server.services import (
+    TICKET_MAX_RESULTS,
+    ticket_status_filter,
+    ticket_status_matches,
+)
 
 MAX_FOLLOWUP_ACCOUNTS = 3
 MAX_KNOWLEDGE_QUERY_TERMS = 8
+# Ticket pages the orchestrator requests per account and status filter.
+MAX_TICKET_PAGES = 2
+TICKET_PAGE_SIZE = TICKET_MAX_RESULTS
+# Recency needs a creation date, which tickets do not have; ticket IDs are not one.
+RECENCY_TERMS = re.compile(
+    r"\b(?:most\s+recent|recent|latest|newest|oldest)\s+(?:[a-z-]+\s+){0,2}?"
+    r"(?:tickets?|incidents?|cases?)\b"
+    r"|\btickets?\b.{0,40}\b(?:chronolog\w*|by date|by creation|sorted by (?:date|time))",
+    re.IGNORECASE,
+)
 
 TICKET_TERMS = re.compile(
     r"\b(?:tickets?|incidents?|issues?|problems?|support|escalat\w*|outages?|complain\w*"
@@ -272,27 +297,22 @@ def plan_evidence(
     calls: list[FollowUp] = []
     gaps: list[str] = []
     if intent.tickets and evidence["accounts"]:
-        targets, ambiguous = _target_accounts(question, evidence["accounts"])
-        # A shortened name ("Northstar") that resolved to one verified account is a target too.
-        for name in requested_names(question):
-            status, ids = account_status(name, evidence, trace)
-            if status == RESOLVED:
-                targets.extend(i for i in ids if i not in targets)
-        targets = targets[:MAX_FOLLOWUP_ACCOUNTS]
-        ambiguous = ambiguous and not targets
+        targets, ambiguous = ticket_targets(question, evidence, trace)
         if ambiguous:
             ids = ", ".join(str(i) for i in sorted(evidence["accounts"]))
             gaps.append(
                 f"Several accounts matched ({ids}) and the question does not name one of "
                 "them exactly, so their tickets were not retrieved automatically."
             )
+        statuses = requested_ticket_statuses(question)
         for account_id in targets:
-            if not _succeeded(trace, "get_account_tickets", account_id=account_id):
-                calls.append(FollowUp(
-                    "get_account_tickets", {"account_id": account_id},
-                    f"The question asks about support issues, but tickets for verified "
-                    f"account {account_id} had not been retrieved.",
-                ))
+            _plan_ticket_page(ticket_coverage(account_id, statuses, evidence, trace),
+                              calls, gaps)
+    if intent.tickets and RECENCY_TERMS.search(question):
+        gaps.append(
+            "The question asks for tickets by recency, but tickets have no creation date. "
+            "Tickets are listed by ticket ID, which is not a chronological order."
+        )
     if intent.knowledge and not _succeeded(trace, "search_knowledge"):
         query = knowledge_query(question, evidence)
         if query:
@@ -302,6 +322,195 @@ def plan_evidence(
             ))
     _plan_account_lookup(question, intent, evidence, trace, calls, gaps)
     return EvidencePlan(calls, gaps)
+
+
+def ticket_targets(
+    question: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> tuple[list[int], bool]:
+    """Verified accounts whose tickets the question asks for, and whether that is ambiguous."""
+    targets, ambiguous = _target_accounts(question, evidence["accounts"])
+    # A shortened name ("Northstar") that resolved to one verified account is a target too.
+    for name in requested_names(question):
+        status, ids = account_status(name, evidence, trace)
+        if status == RESOLVED:
+            targets.extend(i for i in ids if i not in targets)
+    targets = targets[:MAX_FOLLOWUP_ACCOUNTS]
+    return targets, ambiguous and not targets
+
+
+def parse_ticket_page(payload: Any, account_id: Any = None) -> dict[str, Any] | None:
+    """Pagination metadata of a get_account_tickets result; None for legacy or bad shapes.
+
+    With `account_id`, a page for another account, or holding another account's
+    tickets, is rejected.
+    """
+    if isinstance(payload, str):
+        try:
+            return parse_ticket_page(json.loads(payload), account_id)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], str):
+        return parse_ticket_page(payload[0], account_id)  # MCP text-content fallback
+    if not isinstance(payload, dict):
+        return None
+    if "tickets" not in payload and "result" in payload:
+        return parse_ticket_page(payload["result"], account_id)
+    tickets, status_filter = payload.get("tickets"), payload.get("status_filter")
+    numbers = [payload.get(k) for k in ("account_id", "total", "offset", "returned")]
+    if not (isinstance(tickets, list) and isinstance(status_filter, list)
+            and all(type(n) is int and n >= 0 for n in numbers)
+            and all(isinstance(s, str) for s in status_filter)):
+        return None
+    ids = [t["id"] for t in tickets if isinstance(t, dict) and type(t.get("id")) is int]
+    page_account, total, offset, returned = numbers
+    if returned != len(tickets) or len(ids) != len(tickets) or offset + returned > total:
+        return None
+    if account_id is not None and (page_account != account_id or any(
+            t.get("account_id") != account_id for t in tickets)):
+        return None
+    return {"account_id": page_account, "status_filter": sorted(status_filter), "total": total,
+            "offset": offset, "returned": returned, "ticket_ids": ids}
+
+
+def _status_key(status: Any) -> tuple[str, ...] | None:
+    try:
+        return tuple(ticket_status_filter(status))
+    except (ValueError, TypeError):
+        return None
+
+
+def _entry_filter(entry: dict[str, Any]) -> tuple[str, ...] | None:
+    page = entry.get("page")
+    if page:
+        return tuple(page["status_filter"])
+    return _status_key((entry.get("normalized_arguments") or {}).get("status"))
+
+
+def _page_span(pages: list[dict[str, Any]]) -> tuple[bool, int, set[int], int]:
+    """(complete, first offset not covered from 0, unique IDs, latest total) of pages.
+
+    Completeness needs consistent totals, contiguous pages from offset 0 up to the total,
+    and as many unique tickets as the total: has_more alone cannot show skipped pages.
+    """
+    ids: set[int] = set().union(*(page["ticket_ids"] for page in pages))
+    total = pages[-1]["total"]
+    covered = 0
+    for page in sorted(pages, key=lambda p: p["offset"]):
+        if page["offset"] > covered:
+            break
+        covered = max(covered, page["offset"] + page["returned"])
+    consistent = len({page["total"] for page in pages}) == 1
+    return consistent and covered >= total and len(ids) == total, covered, ids, total
+
+
+def ticket_coverage(
+    account_id: int, statuses: frozenset[str] | tuple[str, ...], evidence: dict[str, Any],
+    trace: list[dict[str, Any]],
+) -> TicketCoverage:
+    """Coverage of one account's tickets matching a status filter, from the trace alone.
+
+    Only paged results with metadata can make it complete; a bare list (legacy result) or
+    a page for another filter shows some tickets, never that all were seen. A complete
+    unfiltered retrieval covers every status filter.
+    """
+    wanted = tuple(sorted(statuses))
+    entries = [e for e in trace if e.get("tool") == "get_account_tickets"
+               and (e.get("normalized_arguments") or {}).get("account_id") == account_id
+               and not str(e.get("error") or "").startswith("Unverified record ID")]
+    succeeded = [e for e in entries if e.get("success")]
+    # Pages must belong to this account (also checked when the result is parsed).
+    owned = [e["page"] for e in succeeded
+             if e.get("page") and e["page"]["account_id"] == account_id]
+    pages = [p for p in owned if tuple(p["status_filter"]) == wanted]
+    used = sum(1 for e in succeeded if e.get("origin") == "orchestrator"
+               and _entry_filter(e) == wanted)
+    matching = {ticket_id for ticket_id, ticket in evidence["tickets"].items()
+                if ticket.get("account_id") == account_id
+                and ticket_status_matches(ticket.get("status"), wanted)}
+    name = (evidence["accounts"].get(account_id) or {}).get("name")
+
+    def result(state: str, total: int | None, retrieved: int,
+               next_offset: int | None = None) -> TicketCoverage:
+        return TicketCoverage(account_id, name, wanted, state, total, retrieved,
+                              next_offset, used)
+
+    if pages:
+        complete, covered, ids, total = _page_span(pages)
+        if complete:
+            return result(COMPLETE, total, total)
+    if wanted:
+        broad = [p for p in owned if not p["status_filter"]]
+        broad_complete, _, broad_ids, _ = _page_span(broad) if broad else (False, 0, set(), 0)
+        if broad_complete:
+            count = sum(1 for i in broad_ids if ticket_status_matches(
+                (evidence["tickets"].get(i) or {}).get("status"), wanted))
+            return result(COMPLETE, count, count)
+    if pages:
+        return result(PARTIAL, total, len(ids | matching), covered)
+    # Lookups for another status filter retrieved none of the wanted tickets.
+    if any(_entry_filter(e) in {wanted, ()} for e in succeeded):
+        return result(PARTIAL, None, len(matching), 0)
+    if any(_entry_filter(e) in {wanted, (), None} for e in entries):
+        return result(RETRIEVAL_FAILED, None, len(matching))
+    return result(UNRETRIEVED, None, len(matching))
+
+
+def _plan_ticket_page(
+    coverage: TicketCoverage, calls: list[FollowUp], gaps: list[str]
+) -> None:
+    """The next page an incomplete account needs, or a gap once its page budget is spent."""
+    account_id, label = coverage.account_id, status_label(coverage.status_filter)
+    if coverage.state == COMPLETE:
+        return
+    seen = (f"{coverage.retrieved} of "
+            f"{coverage.total if coverage.total is not None else 'an unknown number of'} "
+            f"{label}tickets")
+    if coverage.pages >= MAX_TICKET_PAGES:
+        gaps.append(
+            f"Tickets for verified account {account_id} were only partially retrieved "
+            f"({seen}); the page limit ({MAX_TICKET_PAGES} per account) was reached."
+        )
+        return
+    arguments: dict[str, Any] = {"account_id": account_id, "limit": TICKET_PAGE_SIZE}
+    if coverage.status_filter:
+        arguments["status"] = list(coverage.status_filter)
+    if coverage.next_offset:
+        arguments["offset"] = coverage.next_offset
+    if coverage.state == PARTIAL:
+        reason = (f"Tickets for verified account {account_id} were only partially retrieved "
+                  f"({seen}); the next page starts at offset {coverage.next_offset or 0}.")
+    elif coverage.state == RETRIEVAL_FAILED:
+        reason = (f"The question asks about support issues, but tickets for verified account "
+                  f"{account_id} could not be retrieved (the lookup failed).")
+    else:
+        reason = (f"The question asks about support issues, but tickets for verified account "
+                  f"{account_id} had not been retrieved.")
+    calls.append(FollowUp("get_account_tickets", arguments, reason))
+
+
+def ticket_call_covers(arguments: dict[str, Any], planned: dict[str, Any]) -> bool:
+    """Whether a requested ticket lookup can stand in for a planned page.
+
+    It must start at the same offset, for the same status filter or (for a first page)
+    without one. Its page size may be smaller: coverage then stays partial and the next
+    page is planned from where it ended.
+    """
+    offset = planned.get("offset", 0)
+    status = _status_key(arguments.get("status"))
+    return (arguments.get("account_id") == planned["account_id"]
+            and (status == _status_key(planned.get("status")) or (status == () and not offset))
+            and arguments.get("offset", 0) == offset)
+
+
+def ticket_coverage_report(
+    question: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> list[TicketCoverage]:
+    """Coverage for every account whose tickets the question asks for."""
+    if not (classify_intent(question).tickets and evidence["accounts"]):
+        return []
+    statuses = requested_ticket_statuses(question)
+    return [ticket_coverage(account_id, statuses, evidence, trace)
+            for account_id in ticket_targets(question, evidence, trace)[0]]
 
 
 def _plan_account_lookup(

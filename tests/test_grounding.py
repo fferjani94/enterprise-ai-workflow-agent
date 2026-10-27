@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage
+from ticket_pages import ticket_page
 
 from enterprise_ai_workflow_agent.agent.graph import investigate
 from enterprise_ai_workflow_agent.agent.grounding import (
@@ -46,7 +47,9 @@ class FakeModel:
 
 class FakeMCP:
     async def call_tool(self, name, args):
-        return SimpleNamespace(isError=False, structuredContent={"result": DATA[name]},
+        result = (ticket_page(DATA[name], args) if name == "get_account_tickets"
+                  else DATA[name])
+        return SimpleNamespace(isError=False, structuredContent={"result": result},
                                content=[])
 
 
@@ -165,7 +168,9 @@ def test_analysis_separates_findings_guidance_and_unsupported_records():
     analysis = run(SSO_QUESTION, "Ticket 1 is a login failure.")["analysis"]
     findings = " ".join(item["text"] for item in analysis["findings"])
     assert "Ticket 1" in findings and "Ticket 2" not in findings
-    assert analysis["findings"][0]["evidence"] == [{"type": "ticket", "id": 1}]
+    assert analysis["findings"][0]["text"] == (
+        "Northstar Labs (Account 1): 2 tickets retrieved (complete).")
+    assert analysis["findings"][1]["evidence"] == [{"type": "ticket", "id": 1}]
 
     unsupported = " ".join(item["text"] for item in analysis["unsupported"])
     assert "Ticket 2" in unsupported and "not evidence of this issue" in unsupported

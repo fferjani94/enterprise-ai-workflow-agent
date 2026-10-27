@@ -47,8 +47,9 @@ def test_account_search(db):
 
 
 def test_ticket_tools(db):
-    tickets = services.get_account_tickets(db, 1)
-    assert len(tickets) == 1
+    page = services.get_account_tickets(db, 1)
+    assert (page["total"], page["returned"], page["has_more"]) == (1, 1, False)
+    tickets = page["tickets"]
     assert services.get_ticket_details(db, tickets[0]["id"])["priority"] == "high"
     assert services.get_ticket_details(db, 999)["found"] is False
     assert services.get_product_information(db, 1)["version"] == "2.4"
@@ -65,7 +66,13 @@ def test_knowledge_search(db):
 
 def test_limits(db):
     with pytest.raises(ValueError):
-        services.get_account_tickets(db, 1, limit=21)
+        services.get_account_tickets(db, 1, limit=51)
+    with pytest.raises(ValueError):
+        services.get_account_tickets(db, 1, limit=0)
+    with pytest.raises(ValueError):
+        services.get_account_tickets(db, 1, offset=-1)
+    with pytest.raises(ValueError):
+        services.get_account_tickets(db, 1, status="pending")
     with pytest.raises(ValueError):
         services.search_knowledge(db, "SSO", limit=0)
 

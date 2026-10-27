@@ -11,6 +11,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from ticket_pages import ticket_page
 
 from enterprise_ai_workflow_agent.agent.followups import (
     account_references,
@@ -35,6 +36,7 @@ from enterprise_ai_workflow_agent.db.models import Account
 from enterprise_ai_workflow_agent.mcp_server import server, services
 
 LIMIT = {"type": "integer", "minimum": 1, "maximum": 20, "default": 10}
+TICKET_LIMIT = {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}
 
 TOOLS = [
     SimpleNamespace(name="search_accounts", description="", inputSchema={
@@ -42,7 +44,8 @@ TOOLS = [
         "properties": {"query": {"type": "string"}, "limit": LIMIT}}),
     SimpleNamespace(name="get_account_tickets", description="", inputSchema={
         "type": "object", "required": ["account_id"],
-        "properties": {"account_id": {"type": "integer"}, "limit": LIMIT}}),
+        "properties": {"account_id": {"type": "integer"}, "limit": TICKET_LIMIT,
+                       "offset": {"type": "integer", "minimum": 0, "default": 0}}}),
     SimpleNamespace(name="search_knowledge", description="", inputSchema={
         "type": "object", "required": ["query"],
         "properties": {"query": {"type": "string"},
@@ -87,12 +90,24 @@ class FakeMCP:
             text = f"Error executing tool {name}: Internal error while reading data"
             return SimpleNamespace(isError=True, structuredContent=None,
                                    content=[SimpleNamespace(type="text", text=text)])
-        return SimpleNamespace(isError=False, structuredContent={"result": self.data[name]},
+        result = (ticket_page(self.data[name], args) if name == "get_account_tickets"
+                  else self.data[name])
+        return SimpleNamespace(isError=False, structuredContent={"result": result},
                                content=[])
 
 
 def call(name, args, id_):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": id_}])
+
+
+def page(account_id, *status, offset=0):
+    """The ticket page call the orchestrator plans."""
+    args = {"account_id": account_id, "limit": 50}
+    if status:
+        args["status"] = list(status)
+    if offset:
+        args["offset"] = offset
+    return ("get_account_tickets", args)
 
 
 def run(question, replies, client=None, max_rounds=4):
@@ -165,9 +180,12 @@ def test_pydantic_validation_errors_are_condensed():
 
 def test_mcp_schemas_publish_limit_bounds_but_not_id_bounds():
     tools = {tool.name: tool.inputSchema for tool in asyncio.run(server.mcp.list_tools())}
-    for name in ("search_accounts", "get_account_tickets", "search_knowledge"):
+    for name in ("search_accounts", "search_knowledge"):
         limit = tools[name]["properties"]["limit"]
         assert (limit["minimum"], limit["maximum"]) == (1, 20)
+    tickets = tools["get_account_tickets"]["properties"]
+    assert (tickets["limit"]["minimum"], tickets["limit"]["maximum"]) == (1, 50)
+    assert tickets["offset"]["minimum"] == 0
     assert "maximum" not in tools["get_account_tickets"]["properties"]["account_id"]
     assert "maximum" not in tools["get_ticket_details"]["properties"]["ticket_id"]
 
@@ -214,7 +232,7 @@ def test_premature_stop_on_ticket_question_triggers_ticket_lookup():
         AIMessage(content="PREMATURE: Northstar Labs is account 1."),
         AIMessage(content="Ticket 11 reports SSO login failures."),
     ])
-    assert client.calls[1] == ("get_account_tickets", {"account_id": 1})
+    assert client.calls[1] == page(1)
     auto = result["tool_trace"][1]
     assert auto["origin"] == "orchestrator"
     assert "account 1" in auto["reason"]
@@ -279,8 +297,8 @@ def test_named_account_is_chosen_among_several_matches():
         AIMessage(content="Two accounts."),
         AIMessage(content="Ticket 11."),
     ], client=client)
-    assert ("get_account_tickets", {"account_id": 1}) in client.calls
-    assert ("get_account_tickets", {"account_id": 2}) not in client.calls
+    assert page(1) in client.calls
+    assert not any(args.get("account_id") == 2 for _, args in client.calls)
     assert result["limited"] is False
 
 
@@ -340,8 +358,9 @@ def test_retrieved_tickets_without_a_match_are_a_complete_negative_result():
         AIMessage(content="No retrieved ticket concerns SSO."),
     ], client=client)
     assert result["limited"] is False
-    assert result["analysis"]["findings"][0]["text"] == (
-        "No retrieved ticket matches the topic of the question.")
+    assert [item["text"] for item in result["analysis"]["findings"]] == [
+        "Northstar Labs (Account 1): 1 ticket retrieved (complete).",
+        "No retrieved ticket matches the topic of the question."]
 
 
 def test_no_matching_account_is_a_complete_negative_result():
@@ -360,7 +379,7 @@ def test_skipped_account_lookup_is_recovered_from_the_question():
         AIMessage(content="Yes, several."), AIMessage(content="Ticket 11 is open."),
     ])
     assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
-                            ("get_account_tickets", {"account_id": 1})]
+                            page(1, "open")]
     assert [entry["origin"] for entry in result["tool_trace"]] == ["orchestrator"] * 2
     assert 'account "Northstar Labs"' in result["tool_trace"][0]["reason"]
     assert result["tool_rounds"] == 2
@@ -409,8 +428,8 @@ def test_listed_account_names_are_each_searched_independently():
     assert client.calls == [
         ("search_accounts", {"query": "Northstar Labs"}),
         ("search_accounts", {"query": "Northwind Retail"}),
-        ("get_account_tickets", {"account_id": 1}),
-        ("get_account_tickets", {"account_id": 2}),
+        page(1, "open"),
+        page(2, "open"),
     ]
     assert result["limited"] is False
 
@@ -425,8 +444,7 @@ def test_unlisted_capitalised_phrases_are_not_searched_as_accounts():
     result, client, _ = run("Investigate CloudDesk tickets for Northstar Labs.", [
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         AIMessage(content="Found it."), AIMessage(content="Ticket 11.")])
-    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
-                            ("get_account_tickets", {"account_id": 1})]
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}), page(1)]
     assert result["limited"] is False
 
 
@@ -474,8 +492,8 @@ def test_combined_account_query_is_not_a_negative_result_for_each_name():
         ("search_accounts", {"query": "Northstar Labs Northwind Retail"}),
         ("search_accounts", {"query": "Northstar Labs"}),
         ("search_accounts", {"query": "Northwind Retail"}),
-        ("get_account_tickets", {"account_id": 1}),
-        ("get_account_tickets", {"account_id": 2}),
+        page(1, "open"),
+        page(2, "open"),
     ]
     assert [e["origin"] for e in result["tool_trace"]] == ["model"] + ["orchestrator"] * 4
     assert 'names the account "Northwind Retail"' in result["tool_trace"][2]["reason"]
@@ -525,8 +543,8 @@ def test_model_repeating_a_combined_search_and_a_failed_lookup_is_treated_as_sta
         ("search_accounts", combined),
         ("search_accounts", {"query": "Northstar Labs"}),
         ("search_accounts", {"query": "Northwind Retail"}),
-        ("get_account_tickets", {"account_id": 1}),
-        ("get_account_tickets", {"account_id": 2}),
+        page(1, "open"),
+        page(2, "open"),
     ]
     assert result["tool_rounds"] == 4
     assert result["limited"] is False
@@ -642,8 +660,7 @@ def test_stalled_model_repeating_lookups_is_replaced_by_required_follow_up():
         call("search_accounts", {"query": "Northstar Labs"}, "b"),
         AIMessage(content="Ticket 11 reports SSO login failures."),
     ])
-    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
-                            ("get_account_tickets", {"account_id": 1})]
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}), page(1)]
     assert [entry["origin"] for entry in result["tool_trace"]] == ["model", "orchestrator"]
     assert result["tool_rounds"] == 2
     assert result["limited"] is False
@@ -685,6 +702,8 @@ TWO_ACCOUNTS = ("List all open support tickets for Northstar Labs and Bluebird C
 # 3 (Bluebird, open, medium).
 SEEDED_TICKETS = {1: (1, "open", "high"), 2: (1, "resolved", "medium"),
                   3: (2, "open", "medium")}
+# What an "open tickets" question retrieves: the status filter is applied in SQL.
+OPEN_TICKETS = {i: t for i, t in SEEDED_TICKETS.items() if t[1] == "open"}
 
 
 def _records(result, kind):
@@ -723,25 +742,25 @@ def test_two_named_accounts_are_resolved_and_their_tickets_retrieved(monkeypatch
     assert client.calls == [
         ("search_accounts", {"query": "Northstar Labs"}),
         ("search_accounts", {"query": "Bluebird Commerce"}),
-        ("get_account_tickets", {"account_id": 1}),
-        ("get_account_tickets", {"account_id": 2}),
+        page(1, "open"),
+        page(2, "open"),
     ]
     assert {i: r["title"] for i, r in _records(result, "account").items()} == {
         1: "Northstar Labs", 2: "Bluebird Commerce"}
-    assert _tickets(result) == SEEDED_TICKETS
+    assert _tickets(result) == OPEN_TICKETS
     assert result["tool_rounds"] == 2
     assert result["limited"] is False
     assert "several possible account names" not in result["answer"]
     # "including" is not a topic: the tickets are not labelled unrelated to the question.
     assert result["answer_source"] == "synthesis"
     assert result["narrative"] == "Ticket 1 (high) and Ticket 3 (medium) are open."
-    # "open support tickets" filters the summary; resolved ticket 2 stays in the evidence.
-    findings = " ".join(item["text"] for item in result["analysis"]["findings"])
-    assert "Ticket 1," in findings and "Ticket 3," in findings
-    assert "Ticket 2," not in findings
-    assert any(item["text"].startswith('Ticket 2, "Dashboard loading slowly" (resolved, '
-                                       'medium), was retrieved but does not have the status')
-               for item in result["analysis"]["context"])
+    findings = [item["text"] for item in result["analysis"]["findings"]]
+    assert findings[:2] == [
+        "Northstar Labs (Account 1): 1 open ticket retrieved (complete).",
+        "Bluebird Commerce (Account 2): 1 open ticket retrieved (complete)."]
+    assert "Ticket 1," in " ".join(findings) and "Ticket 3," in " ".join(findings)
+    assert "Ticket 2" not in result["answer"]
+    assert [c["state"] for c in result["ticket_coverage"]] == ["complete", "complete"]
 
 
 def test_superseded_combined_search_is_not_reported_as_unmatched(monkeypatch):
@@ -751,7 +770,7 @@ def test_superseded_combined_search_is_not_reported_as_unmatched(monkeypatch):
         AIMessage(content="No accounts were found."),
         AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
     ], client=client)
-    assert _tickets(result) == SEEDED_TICKETS
+    assert _tickets(result) == OPEN_TICKETS
     assert "No account matched" not in result["answer"]
     assert result["limited"] is False
 
@@ -786,7 +805,7 @@ def test_unknown_listed_account_does_not_make_known_tickets_unrelated(monkeypatc
         "including their priority.",
         [AIMessage(content="Both have tickets."),
          AIMessage(content="Ticket 1 (high) is open for Northstar Labs.")], client=client)
-    assert _tickets(result) == {i: t for i, t in SEEDED_TICKETS.items() if t[0] == 1}
+    assert _tickets(result) == {1: SEEDED_TICKETS[1]}
     assert {r["relevance"] for r in _records(result, "ticket").values()} == {"unassessed"}
     assert result["answer_source"] == "synthesis"
     assert result["narrative"] == "Ticket 1 (high) is open for Northstar Labs."
@@ -861,8 +880,9 @@ def test_second_account_is_searched_after_the_model_resolved_the_first(monkeypat
         AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
     ], client=client)
     assert client.calls[2:] == [("search_accounts", {"query": "Bluebird Commerce"}),
-                                ("get_account_tickets", {"account_id": 2})]
+                                page(2, "open")]
     assert _searches(client).count("Northstar Labs") == 1
+    # The model's unfiltered page for account 1 is complete, so it covers "open" too.
     assert _tickets(result) == SEEDED_TICKETS
     assert result["tool_rounds"] == 4
     assert result["limited"] is False
@@ -877,10 +897,10 @@ def test_mixed_known_and_unknown_accounts_keep_the_valid_evidence(monkeypatch):
     assert client.calls == [
         ("search_accounts", {"query": "Northstar Labs"}),
         ("search_accounts", {"query": "Globex Corporation"}),
-        ("get_account_tickets", {"account_id": 1}),
+        page(1, "open"),
     ]
     assert list(_records(result, "account")) == [1]
-    assert _tickets(result) == {i: t for i, t in SEEDED_TICKETS.items() if t[0] == 1}
+    assert _tickets(result) == {1: SEEDED_TICKETS[1]}
     assert 'No account matched the search "Globex Corporation".' in result["answer"]
     assert result["limited"] is False
 
@@ -916,7 +936,7 @@ def test_ambiguous_name_listed_with_a_known_account_only_gets_the_known_tickets(
     assert client.calls == [
         ("search_accounts", {"query": "Northstar"}),
         ("search_accounts", {"query": "Bluebird Commerce"}),
-        ("get_account_tickets", {"account_id": 2}),
+        page(2, "open"),
     ]
     assert _tickets(result) == {3: SEEDED_TICKETS[3]}
     assert result["limited"] is True
@@ -933,7 +953,7 @@ def test_repeated_identical_account_search_is_not_re_run(monkeypatch):
     ], client=client)
     assert _searches(client) == ["Northstar Labs", "Bluebird Commerce"]
     assert [e["origin"] for e in result["tool_trace"]] == ["model"] + ["orchestrator"] * 3
-    assert _tickets(result) == SEEDED_TICKETS
+    assert _tickets(result) == OPEN_TICKETS
     assert result["tool_rounds"] == 3
     assert result["limited"] is False
 
@@ -966,8 +986,8 @@ def test_failed_model_calls_leave_rounds_for_both_accounts(
     assert len(failed) == 5
     assert [e["tool"] for e in result["tool_trace"] if e["origin"] == "orchestrator"] == [
         "search_accounts", "search_accounts", "get_account_tickets", "get_account_tickets"]
-    assert len(client.calls) == len({(n, tuple(sorted(a.items()))) for n, a in client.calls})
-    assert _tickets(result) == SEEDED_TICKETS
+    assert len(client.calls) == len({(n, repr(sorted(a.items()))) for n, a in client.calls})
+    assert _tickets(result) == OPEN_TICKETS
     assert result["tool_rounds"] == rounds
     assert result["round_limit_reached"] is False
     assert result["limited"] is False and result["limited_reason"] is None
@@ -991,7 +1011,7 @@ def test_shortened_name_listed_with_another_account_gets_its_tickets(monkeypatch
     assert client.calls[:2] == [("search_accounts", {"query": "Northstar"}),
                                 ("search_accounts", {"query": "Bluebird Commerce"})]
     assert sorted(args["account_id"] for _, args in client.calls[2:]) == [1, 2]
-    assert _tickets(result) == SEEDED_TICKETS
+    assert _tickets(result) == OPEN_TICKETS
     assert result["limited"] is False
 
 
@@ -1032,7 +1052,7 @@ def test_transient_search_failure_is_recovered_once_but_not_found_is_final(monke
          AIMessage(content="The search failed."),
          AIMessage(content="Ticket 1 is open.")], client=client, max_rounds=8)
     assert _searches(client) == ["Northstar", "Northstar Labs", "Globex Corporation"]
-    assert ("get_account_tickets", {"account_id": 1}) in client.calls
+    assert page(1, "open") in client.calls
     assert 'No account matched the search "Globex Corporation".' in result["answer"]
     assert result["tool_rounds"] == 3
     assert result["limited"] is False

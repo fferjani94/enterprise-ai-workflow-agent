@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage
+from ticket_pages import ticket_page
 
 from enterprise_ai_workflow_agent.agent.graph import investigate, normalize_tool_arguments
 
@@ -33,6 +34,8 @@ class FakeMCP:
             "search_knowledge": [{"id": 3, "product_id": 7,
                                   "title": "SSO troubleshooting", "snippet": "Check token expiry"}],
         }.get(name, [])
+        if name == "get_account_tickets":
+            data = ticket_page(data, args)
         return SimpleNamespace(isError=False, structuredContent={"result": data}, content=[])
 
 
@@ -78,7 +81,8 @@ def test_verified_account_and_tickets_are_used_and_reported():
     assert client.calls[1] == ("get_account_tickets", {"account_id": 1})
     assert result["tool_trace"][1]["record_count"] == 1
     assert 'Ticket 2, "SSO login failure"' in result["answer"]
-    assert "contained an unsupported" in result["answer"]
+    assert "has no tickets although ticket retrieval did not establish that" in (
+        result["answer"])
     assert result["answer_source"] == "evidence_summary"
 
 

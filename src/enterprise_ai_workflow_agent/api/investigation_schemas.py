@@ -33,8 +33,39 @@ class ToolTraceEntry(BaseModel):
         default_factory=list, description="Arguments clamped to the tool schema's bounds."
     )
     success: bool
+    executed: bool | None = Field(
+        default=None, description="Whether the MCP tool was actually called. False for "
+        "calls rejected or skipped before execution.")
     record_count: int = 0
     error: str | None = None
+
+
+class ModelProposalEntry(BaseModel):
+    """Diagnostics: a tool call the model proposed, and what became of it."""
+
+    turn: int = Field(description="Model planning turn that proposed the call.")
+    round: int | None = Field(
+        default=None, description="Tool round that executed, rejected or superseded it.")
+    tool: str
+    arguments: Any = None
+    outcome: Literal["executed", "rejected", "superseded"]
+    reason: str | None = None
+    id_verification: Literal["before_batch", "same_batch", "unverified"] | None = Field(
+        default=None, description="For ID-based calls: whether the ID was verified before "
+        "the model's batch, only within that batch, or never.")
+
+
+class ModelTurnEntry(BaseModel):
+    """Diagnostics: the kind of reply one tool-loop model turn produced."""
+
+    turn: int
+    response: Literal["tool_calls", "text", "empty", "error"]
+    tool_calls: int = 0
+    invalid_tool_calls: int = Field(
+        default=0, description="Tool calls whose arguments could not be parsed.")
+    discarded: bool = Field(
+        default=False, description="Removed from the conversation by an orchestrator "
+        "follow-up.")
 
 
 class EvidenceRecord(BaseModel):
@@ -107,6 +138,13 @@ class InvestigationResponse(BaseModel):
     tool_calls: int
     duration_seconds: float
     tool_trace: list[ToolTraceEntry]
+    model_proposals: list[ModelProposalEntry] = Field(
+        default_factory=list, description="Diagnostics: every tool call the model proposed, "
+        "including calls rejected or replaced by orchestrator lookups. Not evidence.")
+    model_turns: int | None = Field(
+        default=None, description="Diagnostics: tool-loop model turns (synthesis excluded).")
+    model_turn_log: list[ModelTurnEntry] = Field(
+        default_factory=list, description="Diagnostics: one entry per tool-loop model turn.")
     evidence: list[EvidenceRecord]
     analysis: InvestigationAnalysis = Field(default_factory=InvestigationAnalysis)
 

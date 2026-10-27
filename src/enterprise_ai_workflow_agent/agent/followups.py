@@ -85,6 +85,14 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 ACCOUNT_TERMS = re.compile(
     r"\b(?:accounts?|plans?|industry|subscriptions?|tiers?)\b", re.IGNORECASE
 )
+# Words that topic_terms() treats as generic but that ask for more than the ticket records.
+EXPLORATORY_TERMS = re.compile(
+    r"\b(?:why|investigat\w*|troubleshoot\w*|fix\w*|guid\w*|recommend\w*|suggest\w*|help"
+    r"|resolve|solve|steps?|problems?|issues?|affect\w*|related|relevant|evidence|cite)\b",
+    re.IGNORECASE,
+)
+# Trace error of a model ticket page skipped because its list was already complete.
+REDUNDANT_PAGE_ERROR = "Ticket list already complete"
 # Capitalised words that start or shape sentences rather than name an account.
 _NOT_NAMES = frozenset("""
 a an and any are can check could did do does explain find for from give has have help how
@@ -416,7 +424,8 @@ def ticket_coverage(
     wanted = tuple(sorted(statuses))
     entries = [e for e in trace if e.get("tool") == "get_account_tickets"
                and (e.get("normalized_arguments") or {}).get("account_id") == account_id
-               and not str(e.get("error") or "").startswith("Unverified record ID")]
+               and not str(e.get("error") or "").startswith(
+                   ("Unverified record ID", REDUNDANT_PAGE_ERROR))]
     succeeded = [e for e in entries if e.get("success")]
     # Pages must belong to this account (also checked when the result is parsed).
     owned = [e["page"] for e in succeeded
@@ -511,6 +520,39 @@ def ticket_coverage_report(
     statuses = requested_ticket_statuses(question)
     return [ticket_coverage(account_id, statuses, evidence, trace)
             for account_id in ticket_targets(question, evidence, trace)[0]]
+
+
+def list_question_satisfied(
+    question: str, evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> bool:
+    """Whether a simple ticket-list question already has every record it asks for.
+
+    Conservative: topic, guidance or exploratory wording, or any requested account that
+    is not resolved to exactly one verified account, keeps the model in the loop.
+    """
+    intent = classify_intent(question)
+    if (not intent.explicit_tickets or intent.knowledge
+            or EXPLORATORY_TERMS.search(question) or RECENCY_TERMS.search(question)):
+        return False
+    names = requested_names(question)
+    if not names or len(names) > MAX_FOLLOWUP_ACCOUNTS:
+        return False
+    states = [account_status(name, evidence, trace) for name in names]
+    if any(state != RESOLVED for state, _ in states):
+        return False
+    entities = [{"type": kind, "title": record.get("name")}
+                for kind, category in (("account", "accounts"), ("product", "products"))
+                for record in evidence[category].values()]
+    if topic_terms(question, entities, tuple(names)):
+        return False
+    plan = plan_evidence(question, evidence, trace)
+    if plan.calls or plan.gaps:
+        return False
+    coverage = {c.account_id: c.state
+                for c in ticket_coverage_report(question, evidence, trace)}
+    resolved = {account_id for _, ids in states for account_id in ids}
+    return (bool(coverage) and resolved <= set(coverage)
+            and all(state == COMPLETE for state in coverage.values()))
 
 
 def _plan_account_lookup(

@@ -77,6 +77,24 @@ def post(service, body):
         return client.post("/api/v1/investigations", json=body)
 
 
+def test_model_proposals_are_exposed_as_diagnostics():
+    proposals = [{"turn": 1, "round": 2, "tool": "get_account_tickets",
+                  "arguments": {"account_id": 999}, "outcome": "rejected",
+                  "reason": "Unverified record ID", "id_verification": "unverified"}]
+    service = FakeService()
+    turn_log = [{"turn": 1, "response": "text", "tool_calls": 0, "invalid_tool_calls": 0,
+                 "discarded": True}]
+    service.result = {**service.result, "model_proposals": proposals, "model_turns": 1,
+                      "model_turn_log": turn_log}
+    body = post(service, {"question": "Investigate SSO for Northstar Labs."}).json()
+    assert body["model_proposals"] == proposals
+    assert (body["model_turns"], body["model_turn_log"]) == (1, turn_log)
+    assert body["tool_calls"] == len(TRACE)
+    legacy = post(FakeService(), {"question": "Hi there."}).json()
+    assert (legacy["model_proposals"], legacy["model_turns"], legacy["model_turn_log"]) == (
+        [], None, [])
+
+
 def test_successful_investigation_serialization():
     service = FakeService()
     response = post(service, {"question": "Investigate SSO for Northstar Labs.",
@@ -97,7 +115,8 @@ def test_successful_investigation_serialization():
 
 def test_trace_and_evidence_are_preserved():
     body = post(FakeService(), {"question": "Investigate"}).json()
-    defaults = {"error": None, "origin": "model", "reason": None, "adjustments": []}
+    defaults = {"error": None, "origin": "model", "reason": None, "adjustments": [],
+                "executed": None}
     assert body["tool_trace"] == [{**defaults, **entry} for entry in TRACE]
     assert body["tool_trace"][1]["error"].startswith("Unverified record ID")
     assert body["evidence"] == [{"relevance_basis": None, **record} for record in EVIDENCE]

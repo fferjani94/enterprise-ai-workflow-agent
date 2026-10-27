@@ -93,9 +93,12 @@ def call(name, args, id_):
 
 
 def run(tool_replies, synthesis_replies=(), question=QUESTION, max_rounds=4, client=None):
+    # The scripts below are model-first: the model searches the account itself, so the
+    # round-limit paths into synthesis stay reachable.
     model = SplitModel(tool_replies, synthesis_replies)
     client = client or FakeMCP()
-    result = asyncio.run(investigate(question, model, client, TOOLS, max_rounds=max_rounds))
+    result = asyncio.run(investigate(question, model, client, TOOLS, max_rounds=max_rounds,
+                                     pre_resolve=False))
     return result, model, client
 
 

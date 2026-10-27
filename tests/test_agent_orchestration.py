@@ -110,10 +110,11 @@ def page(account_id, *status, offset=0):
     return ("get_account_tickets", args)
 
 
-def run(question, replies, client=None, max_rounds=4):
+def run(question, replies, client=None, max_rounds=4, pre_resolve=True):
     client = client or FakeMCP()
     model = FakeModel(replies)
-    result = asyncio.run(investigate(question, model, client, TOOLS, max_rounds=max_rounds))
+    result = asyncio.run(investigate(question, model, client, TOOLS, max_rounds=max_rounds,
+                                     pre_resolve=pre_resolve))
     return result, client, model
 
 
@@ -161,8 +162,9 @@ def test_model_limit_of_1000_is_clamped_before_the_mcp_call_and_traced():
         call("search_accounts", {"query": "Northstar", "limit": 1000}, "a"),
         AIMessage(content="Northstar Labs (account 1) is on Enterprise."),
     ])
-    assert client.calls == [("search_accounts", {"query": "Northstar", "limit": 20})]
-    entry = result["tool_trace"][0]
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
+                            ("search_accounts", {"query": "Northstar", "limit": 20})]
+    entry = result["tool_trace"][1]
     assert entry["arguments"] == {"query": "Northstar", "limit": 1000}
     assert entry["normalized_arguments"] == {"query": "Northstar", "limit": 20}
     assert entry["adjustments"] == ["limit=1000 is outside the allowed range 1..20; used 20"]
@@ -227,11 +229,12 @@ def test_real_server_masks_internal_exceptions(monkeypatch):
 
 def test_premature_stop_on_ticket_question_triggers_ticket_lookup():
     question = "Investigate SSO login failures for Northstar Labs."
+    # Model-first path: the model searched the account itself.
     result, client, model = run(question, [
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         AIMessage(content="PREMATURE: Northstar Labs is account 1."),
         AIMessage(content="Ticket 11 reports SSO login failures."),
-    ])
+    ], pre_resolve=False)
     assert client.calls[1] == page(1)
     auto = result["tool_trace"][1]
     assert auto["origin"] == "orchestrator"
@@ -256,13 +259,14 @@ def test_account_only_question_does_not_fetch_tickets():
 
 
 def test_model_that_fetched_tickets_itself_gets_no_extra_calls():
+    # The account is resolved before the first model turn; the model then pages the tickets.
     result, client, _ = run("Investigate SSO login failures for Northstar Labs.", [
-        call("search_accounts", {"query": "Northstar"}, "a"),
         call("get_account_tickets", {"account_id": 1, "limit": 5}, "b"),
         AIMessage(content="Ticket 11 reports SSO login failures."),
     ])
-    assert len(client.calls) == 2
-    assert all(entry["origin"] == "model" for entry in result["tool_trace"])
+    assert client.calls == [("search_accounts", {"query": "Northstar Labs"}),
+                            ("get_account_tickets", {"account_id": 1, "limit": 5})]
+    assert [entry["origin"] for entry in result["tool_trace"]] == ["orchestrator", "model"]
     assert result["limited"] is False
 
 
@@ -389,12 +393,14 @@ def test_skipped_account_lookup_is_recovered_from_the_question():
 
 def test_recovery_runs_with_required_guidance_and_chains_to_tickets():
     # Observed with qwen2.5:3b: the model replied without any tool call, so only the
-    # guidance follow-up ran and the run ended limited.
+    # guidance follow-up ran and the run ended limited. The named account is now resolved
+    # first, so tickets and guidance are retrieved together in the next round.
     question = "Northstar Labs reports SSO login failures. What tickets exist and how do we fix it?"
     result, client, _ = run(question, [AIMessage(content="Try this."),
                                        AIMessage(content="Document 21 covers SSO.")])
     assert [name for name, _ in client.calls] == [
-        "search_knowledge", "search_accounts", "get_account_tickets"]
+        "search_accounts", "get_account_tickets", "search_knowledge"]
+    assert result["tool_rounds"] == 2
     assert result["limited"] is False
 
 
@@ -482,12 +488,12 @@ class AccountDirectory(FakeMCP):
 def test_combined_account_query_is_not_a_negative_result_for_each_name():
     # Observed with qwen2.5:3b on the dashboard's "Open tickets across both accounts" example:
     # one search for "Northstar Labs Northwind Retail" matched nothing, and the run was
-    # reported as complete with no records.
+    # reported as complete with no records. Model-first path, as in that run.
     client = AccountDirectory(accounts=(NORTHSTAR, NORTHWIND))
     result, client, _ = run(
         "List all open support tickets for Northstar Labs and Northwind Retail.",
         [call("search_accounts", {"query": "Northstar Labs Northwind Retail"}, "a"),
-         AIMessage(content="No accounts were found.")], client=client)
+         AIMessage(content="No accounts were found.")], client=client, pre_resolve=False)
     assert client.calls == [
         ("search_accounts", {"query": "Northstar Labs Northwind Retail"}),
         ("search_accounts", {"query": "Northstar Labs"}),
@@ -501,11 +507,12 @@ def test_combined_account_query_is_not_a_negative_result_for_each_name():
 
 
 def test_partial_name_search_that_matched_nothing_is_a_negative_result():
+    # Model-first path: the model's own shortened search covers the full name.
     client = AccountDirectory(accounts=())
     result, client, _ = run("Investigate SSO login failures for Globex Corporation.", [
         call("search_accounts", {"query": "Globex"}, "a"),
         AIMessage(content="No such account."),
-    ], client=client)
+    ], client=client, pre_resolve=False)
     assert client.calls == [("search_accounts", {"query": "Globex"})]
     assert result["limited"] is False
 
@@ -538,7 +545,7 @@ def test_model_repeating_a_combined_search_and_a_failed_lookup_is_treated_as_sta
              {"name": "search_accounts", "args": combined, "id": "c"},
              {"name": "get_account_tickets", "args": {"account_id": 12345}, "id": "d"}]),
          AIMessage(content="Ticket 11 is open for Northstar Labs.")],
-        client=client)
+        client=client, pre_resolve=False)
     assert client.calls == [
         ("search_accounts", combined),
         ("search_accounts", {"query": "Northstar Labs"}),
@@ -576,11 +583,12 @@ def test_round_limit_before_any_record_is_limited():
 
 
 def test_failed_account_search_gets_one_recovery_attempt_and_no_retry_loop():
+    # Model-first path: the recovery follows the model's own failed search.
     client = FakeMCP(failing={"search_accounts"})
     result, client, _ = run("Does Northstar Labs have open tickets?", [
         call("search_accounts", {"query": "Northstar"}, "a"),
         AIMessage(content="The lookup failed."),
-    ], client=client, max_rounds=8)
+    ], client=client, max_rounds=8, pre_resolve=False)
     assert client.calls == [("search_accounts", {"query": "Northstar"}),
                             ("search_accounts", {"query": "Northstar Labs"})]
     assert result["tool_rounds"] == 2
@@ -592,11 +600,12 @@ def test_failed_account_search_gets_one_recovery_attempt_and_no_retry_loop():
 
 def test_last_round_runs_required_lookups_before_model_selected_ones():
     question = "Investigate SSO login failures for Northstar Labs and suggest next steps."
+    # Model-first path: round reservation applies to the model's own plan.
     result, client, _ = run(question, [
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1}, "b"),
         AIMessage(content="Ticket 11 and Document 21 concern SSO."),
-    ], max_rounds=2)
+    ], max_rounds=2, pre_resolve=False)
     assert [(e["tool"], e["origin"]) for e in result["tool_trace"]] == [
         ("search_accounts", "model"), ("search_knowledge", "orchestrator"),
         ("get_account_tickets", "model")]
@@ -610,7 +619,7 @@ def test_last_round_keeps_the_model_request_when_it_covers_required_lookups():
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1, "limit": 5}, "b"),
         AIMessage(content="Ticket 11 concerns SSO."),
-    ], max_rounds=2)
+    ], max_rounds=2, pre_resolve=False)
     assert all(entry["origin"] == "model" for entry in result["tool_trace"])
     assert result["limited"] is False
 
@@ -649,7 +658,7 @@ def test_identical_calls_in_one_round_run_once():
         {"name": "search_accounts", "args": {"query": "Northstar Labs"}, "id": "b"},
     ])
     result, client, _ = run("What plan is Northstar Labs on?",
-                            [model_turn, AIMessage(content="Account 1.")])
+                            [model_turn, AIMessage(content="Account 1.")], pre_resolve=False)
     assert len(client.calls) == 1
     assert [entry["success"] for entry in result["tool_trace"]] == [True, False]
 
@@ -659,7 +668,7 @@ def test_stalled_model_repeating_lookups_is_replaced_by_required_follow_up():
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("search_accounts", {"query": "Northstar Labs"}, "b"),
         AIMessage(content="Ticket 11 reports SSO login failures."),
-    ])
+    ], pre_resolve=False)
     assert client.calls == [("search_accounts", {"query": "Northstar Labs"}), page(1)]
     assert [entry["origin"] for entry in result["tool_trace"]] == ["model", "orchestrator"]
     assert result["tool_rounds"] == 2
@@ -873,12 +882,13 @@ def test_status_filter_without_matching_tickets_says_so():
 
 def test_second_account_is_searched_after_the_model_resolved_the_first(monkeypatch):
     client = SeededMCP(monkeypatch)
+    # Model-first path: the model resolves only one of the two listed accounts.
     result, client, _ = run(TWO_ACCOUNTS, [
         call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1}, "b"),
         AIMessage(content="Ticket 1 is open with high priority."),
         AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
-    ], client=client)
+    ], client=client, pre_resolve=False)
     assert client.calls[2:] == [("search_accounts", {"query": "Bluebird Commerce"}),
                                 page(2, "open")]
     assert _searches(client).count("Northstar Labs") == 1
@@ -950,7 +960,7 @@ def test_repeated_identical_account_search_is_not_re_run(monkeypatch):
     result, client, _ = run(TWO_ACCOUNTS, [
         northstar, northstar,
         AIMessage(content="Ticket 1 (high) and Ticket 3 (medium) are open."),
-    ], client=client)
+    ], client=client, pre_resolve=False)
     assert _searches(client) == ["Northstar Labs", "Bluebird Commerce"]
     assert [e["origin"] for e in result["tool_trace"]] == ["model"] + ["orchestrator"] * 3
     assert _tickets(result) == OPEN_TICKETS
@@ -1050,7 +1060,8 @@ def test_transient_search_failure_is_recovered_once_but_not_found_is_final(monke
         "List open support tickets for Northstar Labs and Globex Corporation.",
         [call("search_accounts", {"query": "Northstar"}, "a"),
          AIMessage(content="The search failed."),
-         AIMessage(content="Ticket 1 is open.")], client=client, max_rounds=8)
+         AIMessage(content="Ticket 1 is open.")], client=client, max_rounds=8,
+        pre_resolve=False)
     assert _searches(client) == ["Northstar", "Northstar Labs", "Globex Corporation"]
     assert page(1, "open") in client.calls
     assert 'No account matched the search "Globex Corporation".' in result["answer"]
@@ -1066,7 +1077,7 @@ def test_single_account_model_keeps_control_when_it_searches_the_account(monkeyp
         call("get_account_tickets", {"account_id": 1}, "c"),
         AIMessage(content="Ticket 1 is open."),
         AIMessage(content="Ticket 1 is open."),
-    ], client=client)
+    ], client=client, pre_resolve=False)
     assert all(e["origin"] == "model" for e in result["tool_trace"])
     assert result["tool_rounds"] == 3
     assert result["limited"] is False

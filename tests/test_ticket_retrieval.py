@@ -362,10 +362,10 @@ def test_failed_second_page_is_partial_and_not_retried():
 def test_model_limit_one_does_not_end_retrieval():
     client = ServiceMCP(make_sessions({"Northstar Labs": ["open"] * 30}))
     result, _ = run(OPEN_QUESTION, [
-        call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1, "status": "open", "limit": 1}, "b"),
         AIMessage(content="Ticket 1 is open."), AIMessage(content="Ticket 1 is open.")],
         client)
+    assert client.calls[0] == ("search_accounts", {"query": "Northstar Labs"})
     assert client.calls[2] == page(1, "open", offset=1)
     assert result["ticket_coverage"][0]["state"] == COMPLETE
     assert result["ticket_coverage"][0]["total"] == 30
@@ -380,7 +380,6 @@ def test_model_limit_one_does_not_end_retrieval():
 def test_partial_retrieval_claims_are_checked_on_the_displayed_answer(answer, kept):
     client = ServiceMCP(make_sessions({"Northstar Labs": ["open"] * 120}))
     result, _ = run(OPEN_QUESTION, [
-        call("search_accounts", {"query": "Northstar Labs"}, "a"),
         call("get_account_tickets", {"account_id": 1, "status": "open", "limit": 50}, "b"),
         AIMessage(content=answer)], client, max_rounds=2)
     assert result["limited"] is True
@@ -451,11 +450,11 @@ def test_recency_request_is_reported_not_answered_by_ticket_id():
 
 def test_truncated_tool_message_does_not_affect_coverage():
     client = ServiceMCP(make_sessions({"Northstar Labs": ["open"] * 50}, subject="x" * 180))
-    result, model = run(OPEN_QUESTION, [
-        call("search_accounts", {"query": "Northstar Labs"}, "a"),
+    # An investigation, not a plain list, so the model is shown the page after it completes.
+    result, model = run("Investigate the open support tickets for Northstar Labs.", [
         call("get_account_tickets", {"account_id": 1, "status": "open", "limit": 50}, "b"),
         AIMessage(content="Done."), AIMessage(content="Ticket 1 is open.")], client)
-    shown = [m.content for m in model.seen[2] if isinstance(m, ToolMessage)][-1]
+    shown = [m.content for m in model.seen[1] if isinstance(m, ToolMessage)][-1]
     assert shown.endswith("[TRUNCATED]") and '"total": 50' in shown
     assert result["ticket_coverage"][0]["state"] == COMPLETE
     assert result["tool_trace"][1]["record_count"] == 50

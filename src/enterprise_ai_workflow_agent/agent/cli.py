@@ -21,6 +21,8 @@ async def run(question: str, model_name: str, max_rounds: int) -> None:
                                    max_rounds=max_rounds)
         print("\nANSWER\n" + str(result["answer"]))
         print("\nTOOL TRACE\n" + json.dumps(result["tool_trace"], indent=2))
+        print("\nMODEL PROPOSALS\n" + json.dumps(result["model_proposals"], indent=2))
+        print("\nMODEL TURNS\n" + json.dumps(result["model_turn_log"], indent=2))
         print(f"\nTool rounds: {result['tool_rounds']}")
         print(f"Status: {'limited' if result['limited'] else 'completed'}; "
               f"answer source: {result['answer_source']}")

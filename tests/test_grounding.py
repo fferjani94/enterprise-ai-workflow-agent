@@ -71,9 +71,9 @@ def _call(name, args, id_):
 
 def run(question, final_answer, synthesis=None):
     """The model stops with complete evidence, so its answer goes to synthesis. By default
-    the synthesis repeats the answer, so the grounding checks below apply to that text."""
+    the synthesis repeats the answer, so the grounding checks below apply to that text.
+    The named account is searched before the model's first turn."""
     replies = [
-        _call("search_accounts", {"query": "Northstar Labs"}, "a"),
         _call("get_account_tickets", {"account_id": 1}, "b"),
         _call("search_knowledge", {"query": "SSO login issues"}, "c"),
         AIMessage(content=final_answer),

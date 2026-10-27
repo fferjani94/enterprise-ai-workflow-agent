@@ -27,6 +27,9 @@ TicketLimit = Annotated[
 ]
 Offset = Annotated[int, Field(ge=0, description="Number of matching tickets to skip.")]
 TicketStatus = Literal["open", "resolved", "closed", "unresolved"]
+AccountId = Annotated[
+    int, Field(description="Account ID from a successful search_accounts result.")
+]
 
 
 def _run(operation: Callable[..., Any], *args: Any) -> Any:
@@ -46,14 +49,19 @@ def _run(operation: Callable[..., Any], *args: Any) -> Any:
 
 @mcp.tool()
 def search_accounts(query: str, limit: Limit = 10) -> list[dict]:
-    """Search fictional SaaS customer accounts by name (read-only)."""
+    """Search fictional SaaS customer accounts by name (read-only).
+
+    Matches a case-insensitive substring of the name; use one account name per query."""
     return _run(services.search_accounts, query, limit)
 
 
 @mcp.tool()
 def get_account_tickets(
-    account_id: int,
-    status: TicketStatus | list[TicketStatus] | None = None,
+    account_id: AccountId,
+    status: Annotated[
+        TicketStatus | list[TicketStatus] | None,
+        Field(description="Only tickets with this status (or any of these); omit for all."),
+    ] = None,
     limit: TicketLimit = 10,
     offset: Offset = 0,
 ) -> dict[str, Any]:

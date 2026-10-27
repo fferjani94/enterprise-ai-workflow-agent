@@ -17,17 +17,21 @@ from langchain_core.messages import (
 from langgraph.graph import END, START, StateGraph, add_messages
 
 from enterprise_ai_workflow_agent.agent.followups import (
+    REDUNDANT_PAGE_ERROR,
     FollowUp,
     classify_intent,
+    list_question_satisfied,
     parse_ticket_page,
     plan_evidence,
     search_covers,
     ticket_call_covers,
+    ticket_coverage,
     ticket_coverage_report,
     unresolved_listed_accounts,
 )
 from enterprise_ai_workflow_agent.agent.grounding import (
     CAUSAL_NOTE,
+    COMPLETE,
     FIX_CLAIM_NOTE,
     UNCITED_GUIDANCE_NOTE,
     TicketCoverage,
@@ -40,11 +44,13 @@ from enterprise_ai_workflow_agent.agent.grounding import (
     remove_uncited_guidance,
     render_sections,
     requested_ticket_statuses,
+    status_label,
     unrelated_mentions,
     unsupported_completeness_claims,
     unsupported_no_ticket_claims,
 )
 from enterprise_ai_workflow_agent.agent.synthesis import SYNTHESIS_PROMPT, synthesis_input
+from enterprise_ai_workflow_agent.mcp_server.services import ticket_status_filter
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +98,10 @@ class AgentState(TypedDict):
     synthesis_attempted: bool
     answer_source: str
     answer_notice: str | None
+    # Diagnostics only: never read by evidence, coverage or grounding.
+    model_turns: int
+    model_proposals: list[dict[str, Any]]
+    model_turn_log: list[dict[str, Any]]
 
 
 def _tool_specs(mcp_tools: list[Any]) -> list[dict[str, Any]]:
@@ -199,6 +209,46 @@ DEPENDENT_IDS = {
 
 def _empty_evidence() -> dict[str, Any]:
     return {"accounts": {}, "tickets": {}, "products": {}, "documents": {}}
+
+
+# When a dependent record ID was established, relative to the tool-call batch using it.
+VERIFIED_BEFORE_BATCH = "before_batch"
+VERIFIED_SAME_BATCH = "same_batch"
+NEVER_VERIFIED = "unverified"
+# Proposal outcomes recorded in model_proposals.
+PROPOSAL_EXECUTED, PROPOSAL_REJECTED, PROPOSAL_SUPERSEDED = "executed", "rejected", "superseded"
+MAX_LISTED_IDS = 5
+
+
+def _id_verification(value: Any, before: dict[int, Any], now: dict[int, Any]) -> str:
+    if type(value) is int and value in before:
+        return VERIFIED_BEFORE_BATCH
+    if type(value) is int and value in now:
+        return VERIFIED_SAME_BATCH
+    return NEVER_VERIFIED
+
+
+def _unverified_details(
+    key: str, value: Any, category: str, records: dict[int, Any], same_batch: bool
+) -> str:
+    """Short corrective feedback listing only IDs this investigation has verified."""
+    text = f"{key}={value!r} has not been established by a previous tool result."
+    if same_batch:
+        text += (" It was only returned by another call in the same request; use it in a "
+                 "later request.")
+    listed = [f"{i} ({str(r['name'])[:60]})" if r.get("name") else str(i)
+              for i, r in sorted(records.items())[:MAX_LISTED_IDS]]
+    more = len(records) - len(listed)
+    text += (f" Verified {category[:-1]} IDs: "
+             f"{', '.join(listed) + (f' and {more} more' if more > 0 else '') or 'none yet'}.")
+    if category == "accounts":
+        text += (" Search each account name separately with search_accounts and use an ID "
+                 "from its result.")
+    elif category == "products":
+        text += " For knowledge search, omit product_id if unknown."
+    else:
+        text += " Retrieve the record with a lookup first."
+    return text
 
 
 # (evidence category, public record type, title key, description key)
@@ -319,6 +369,23 @@ def _call_key(name: str, arguments: Any) -> str:
     return json.dumps([name, arguments], sort_keys=True, default=str)
 
 
+def _complete_ticket_list(
+    name: str, args: dict[str, Any], evidence: dict[str, Any], trace: list[dict[str, Any]]
+) -> str | None:
+    """Why a ticket page cannot add records: its account and status filter are complete."""
+    if name != "get_account_tickets" or type(args.get("account_id")) is not int:
+        return None
+    try:
+        statuses = frozenset(ticket_status_filter(args.get("status")))
+    except (ValueError, TypeError):
+        return None  # left to the MCP tool, which reports invalid statuses
+    coverage = ticket_coverage(args["account_id"], statuses, evidence, trace)
+    if coverage.state != COMPLETE:
+        return None
+    return (f"All {coverage.total} {status_label(coverage.status_filter)}tickets for account "
+            f"{coverage.account_id} were already retrieved; use the earlier result.")
+
+
 def _succeeded_keys(trace: list[dict[str, Any]]) -> set[str]:
     return {
         _call_key(entry["tool"], entry.get("normalized_arguments"))
@@ -370,17 +437,21 @@ def _is_transient(exc: Exception) -> bool:
 
 
 async def _invoke_with_retries(
-    runnable: Any, attempts: list[list[BaseMessage]], stage: str, allow_tool_calls: bool = False
+    runnable: Any, attempts: list[list[BaseMessage]], stage: str, allow_tool_calls: bool = False,
+    malformed: list[dict[str, Any]] | None = None,
 ) -> tuple[Any | None, Exception | None]:
     """Invoke the model, retrying only transient failures, at most len(attempts) times.
 
     A reply with neither text nor (when allowed) tool calls counts as a transient failure:
-    small local models occasionally return an empty message.
+    small local models occasionally return an empty message. Malformed tool calls of every
+    attempt are appended to `malformed`.
     """
     failure: Exception | None = None
     for made, messages in enumerate(attempts, start=1):
         try:
             reply = await runnable.ainvoke(messages)
+            if malformed is not None:
+                malformed.extend(getattr(reply, "invalid_tool_calls", None) or [])
             has_text = bool(str(getattr(reply, "content", "") or "").strip())
             if not has_text and not (allow_tool_calls and getattr(reply, "tool_calls", None)):
                 raise _EmptyReply("empty reply")
@@ -400,8 +471,14 @@ async def _invoke_with_retries(
     return None, failure
 
 
-def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX_TOOL_ROUNDS):
-    """Build graph; client must expose async call_tool(name, arguments)."""
+def build_graph(
+    model: Any, client: Any, tools: list[Any], max_rounds: int = MAX_TOOL_ROUNDS,
+    pre_resolve: bool = True,
+):
+    """Build graph; client must expose async call_tool(name, arguments).
+
+    `pre_resolve=False` keeps the model-first path (baseline for evaluations).
+    """
     if max_rounds < 1:
         raise ValueError("max_rounds must be positive")
     tool_names = {tool.name for tool in tools}
@@ -421,7 +498,72 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
 
     def attempted_keys(state: AgentState) -> set[str]:
         return {_call_key(entry["tool"], entry.get("normalized_arguments"))
-                for entry in state["tool_trace"]}
+                for entry in state["tool_trace"]
+                if not now_verified(entry, state["evidence"])}
+
+    def now_verified(entry: dict[str, Any], evidence: dict[str, Any]) -> bool:
+        """An unverified-ID rejection whose ID has since been verified: retrying is new."""
+        dependency = DEPENDENT_IDS.get(entry["tool"])
+        if not dependency or not str(entry.get("error") or "").startswith(
+                "Unverified record ID"):
+            return False
+        value = (entry.get("normalized_arguments") or {}).get(dependency[0])
+        return type(value) is int and value in evidence[dependency[1]]
+
+    def prepared(call: dict[str, Any]) -> Any:
+        name, args = call["name"], call["args"]
+        return (prepare_arguments(name, args)[0]
+                if name in tool_names and isinstance(args, dict) else args)
+
+    def proposal(
+        state: AgentState, name: str, arguments: Any, outcome: str, reason: str | None = None,
+        verification: str | None = None, round_number: int | None = None,
+        turn: int | None = None,
+    ) -> dict[str, Any]:
+        entry = {"turn": state["model_turns"] if turn is None else turn, "round": round_number,
+                 "tool": name, "arguments": arguments, "outcome": outcome}
+        if reason:
+            entry["reason"] = reason
+        if verification:
+            entry["id_verification"] = verification
+        return entry
+
+    def pre_resolution_calls(state: AgentState) -> list[FollowUp]:
+        """Searches for the account names the question states, run before the first model turn.
+
+        Only account searches are taken from the plan; tickets and documents stay with the
+        model and the follow-ups. With a single round the model keeps it for its own plan.
+        """
+        if max_rounds < 2 or not pre_resolve:
+            return []
+        plan = plan_evidence(state["question"], state["evidence"], state["tool_trace"])
+        return [call for call in plan.calls
+                if call.tool == "search_accounts" and call.tool in tool_names
+                ][:MAX_TOOL_CALLS_PER_ROUND]
+
+    async def resolve_accounts(state: AgentState) -> dict:
+        searches = pre_resolution_calls(state)
+        if not searches:
+            return {}
+        calls = [
+            {"name": item.tool, "args": item.arguments, "type": "tool_call",
+             "id": f"{ORCHESTRATOR_CALL_PREFIX}resolve-{index}"}
+            for index, item in enumerate(searches)
+        ]
+        logger.info("Resolving named accounts before planning: %s",
+                    [item.arguments for item in searches])
+        return {
+            "messages": [AIMessage(content="", tool_calls=calls)],
+            "followup_reasons": {
+                call["id"]: (f"The question names the account \"{item.arguments['query']}\"; "
+                             "it was searched before the model planned its lookups.")
+                for call, item in zip(calls, searches, strict=True)
+            },
+        }
+
+    def after_resolve(state: AgentState) -> str:
+        latest = state["messages"][-1]
+        return "tools" if isinstance(latest, AIMessage) and latest.tool_calls else "reason"
 
     async def reason(state: AgentState) -> dict:
         with_system = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
@@ -429,33 +571,58 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
         # limit" error or an empty stream. Sampling is random, so retry, alternating with
         # and without the system message (both verified to work with the five MCP schemas).
         attempts = [with_system, state["messages"]] * (MODEL_ATTEMPTS // 2)
+        malformed: list[dict[str, Any]] = []
         answer, failure = await _invoke_with_retries(
-            bound_model, attempts, "tool loop", allow_tool_calls=True)
+            bound_model, attempts, "tool loop", allow_tool_calls=True, malformed=malformed)
+        turn = state["model_turns"] + 1
+        update: dict[str, Any] = {"model_turns": turn}
         if failure is None:
-            return {"messages": [answer]}
-        if isinstance(failure, _EmptyReply):
+            message = answer
+            response = "tool_calls" if getattr(answer, "tool_calls", None) else "text"
+        elif isinstance(failure, _EmptyReply):
             # Persistent empty replies are not an infrastructure failure: continue as if
             # the model stopped, so follow-ups, synthesis and status rules still apply.
-            return {"messages": [AIMessage(content="")]}
-        return {"messages": [AIMessage(content=(
-            "The local model failed to respond. "
-            f"Error type: {type(failure).__name__}. "
-            "See the application logs for details."
-        ))], "model_error": type(failure).__name__}
+            message, response = AIMessage(content=""), "empty"
+        else:
+            message, response = AIMessage(content=(
+                "The local model failed to respond. "
+                f"Error type: {type(failure).__name__}. "
+                "See the application logs for details."
+            )), "error"
+            update["model_error"] = type(failure).__name__
+        update["messages"] = [message]
+        update["model_turn_log"] = [*state["model_turn_log"], {
+            "turn": turn, "response": response,
+            "tool_calls": len(getattr(message, "tool_calls", None) or []),
+            "invalid_tool_calls": len(malformed), "discarded": False,
+        }]
+        if malformed:
+            # Raw arguments are not kept: they are unparsed model output.
+            update["model_proposals"] = [*state["model_proposals"], *(
+                proposal(state, str(call.get("name") or "unknown"), None, PROPOSAL_REJECTED,
+                         "Malformed tool call: its arguments could not be parsed.", turn=turn)
+                for call in malformed)]
+        return update
 
     async def execute_tools(state: AgentState) -> dict:
         calls = state["messages"][-1].tool_calls[:MAX_TOOL_CALLS_PER_ROUND]
         followup_reasons = state.get("followup_reasons") or {}
         responses = []
         trace = list(state["tool_trace"])
+        proposals = list(state["model_proposals"])
+        round_number = state["tool_rounds"] + 1
         succeeded = _succeeded_keys(trace)
-        evidence = {key: dict(value) for key, value in state["evidence"].items()}
+        before = state["evidence"]
+        evidence = {key: dict(value) for key, value in before.items()}
         for call in calls:
             name, args = call["name"], call["args"]
+            from_model = call["id"] not in followup_reasons
             normalized_args = args
             adjustments: list[str] = []
             count = 0
             page = None
+            verification = None
+            sent = False
             if name not in tool_names:
                 payload = {"error": f"Unknown tool: {name}"}
                 ok = False
@@ -466,16 +633,18 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                 normalized_args, adjustments = prepare_arguments(name, args)
                 dependency = DEPENDENT_IDS.get(name)
                 required_id = normalized_args.get(dependency[0]) if dependency else None
-                if (dependency and required_id is not None and
-                        (type(required_id) is not int or
-                         required_id not in evidence[dependency[1]])):
+                if dependency and required_id is not None:
+                    verification = _id_verification(
+                        required_id, before[dependency[1]], evidence[dependency[1]])
+                # The model cannot have seen an ID returned within its own batch, so such an
+                # ID is a guess. Orchestrator lookups only use IDs from completed rounds.
+                if dependency and (verification == NEVER_VERIFIED or (
+                        from_model and verification == VERIFIED_SAME_BATCH)):
                     payload = {
                         "error": "Unverified record ID",
-                        "details": (
-                            f"{dependency[0]}={required_id!r} has not been established "
-                            "by a previous tool result. Search for the record first. "
-                            "For knowledge search, omit product_id if unknown."
-                        ),
+                        "details": _unverified_details(
+                            dependency[0], required_id, dependency[1],
+                            evidence[dependency[1]], verification == VERIFIED_SAME_BATCH),
                     }
                     ok = False
                 elif _call_key(name, normalized_args) in succeeded:
@@ -486,7 +655,12 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                                    "result or call a different tool.",
                     }
                     ok = False
+                elif from_model and (complete := _complete_ticket_list(
+                        name, normalized_args, evidence, trace)):
+                    payload = {"error": REDUNDANT_PAGE_ERROR, "details": complete}
+                    ok = False
                 else:
+                    sent = True
                     try:
                         result = await client.call_tool(name, normalized_args)
                         if result.isError:
@@ -528,6 +702,7 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                 "arguments": args,
                 "normalized_arguments": normalized_args,
                 "success": ok,
+                "executed": sent,
                 "record_count": count,
             }
             if call["id"] in followup_reasons:
@@ -540,6 +715,11 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
             if not ok:
                 entry["error"] = _tool_error(payload)
             trace.append(entry)
+            if from_model:
+                proposals.append(proposal(
+                    state, name, normalized_args,
+                    PROPOSAL_EXECUTED if sent else PROPOSAL_REJECTED,
+                    entry.get("error"), verification, round_number))
         for call in state["messages"][-1].tool_calls[MAX_TOOL_CALLS_PER_ROUND:]:
             responses.append(
                 ToolMessage(
@@ -553,14 +733,18 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                     "tool": call["name"],
                     "origin": "model",
                     "success": False,
+                    "executed": False,
                     "error": "Tool-call limit exceeded",
                 }
             )
+            proposals.append(proposal(state, call["name"], prepared(call), PROPOSAL_REJECTED,
+                                      "Tool-call limit exceeded", round_number=round_number))
         return {
             "messages": responses,
-            "tool_rounds": state["tool_rounds"] + 1,
+            "tool_rounds": round_number,
             "tool_trace": trace,
             "evidence": evidence,
+            "model_proposals": proposals,
         }
 
     def pending_followups(state: AgentState) -> list[FollowUp]:
@@ -661,6 +845,10 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
         # run (an account search, then its tickets) continue while rounds remain; then
         # the answer is written from the evidence.
         if not state["after_followup"]:
+            # A simple ticket list with every page retrieved: the model can only add calls.
+            if list_question_satisfied(state["question"], state["evidence"],
+                                       state["tool_trace"]):
+                return "synthesize"
             return "reason"
         if state["tool_rounds"] < max_rounds and pending_followups(state):
             return "followup"
@@ -695,6 +883,16 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
         ]
         logger.info("Orchestrator adds %s%s", [(item.tool, item.arguments) for item in pending],
                     f" before {len(model_calls)} model call(s)" if model_calls else "")
+        kept = {call["id"] for call in model_calls}
+        superseded = [
+            proposal(state, call["name"], prepared(call), PROPOSAL_SUPERSEDED,
+                     "Repeats an earlier lookup." if is_repeat(call, attempted)
+                     else "Replaced by the same orchestrator lookup.", round_number=round_number)
+            for call in (getattr(latest, "tool_calls", None) or []) if call["id"] not in kept
+        ]
+        turn_log = state["model_turn_log"]
+        if isinstance(latest, AIMessage) and turn_log:
+            turn_log = [*turn_log[:-1], {**turn_log[-1], "discarded": True}]
         return {
             "messages": [
                 RemoveMessage(id=latest.id),
@@ -704,11 +902,19 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                 call["id"]: item.reason for call, item in zip(tool_calls, pending, strict=True)
             },
             "after_followup": True,
+            "model_proposals": [*state["model_proposals"], *superseded],
+            "model_turn_log": turn_log,
         }
 
     async def limit(state: AgentState) -> dict:
         logger.info("Tool-round limit (%d) reached; moving to final synthesis", max_rounds)
-        return {"round_limit_reached": True}
+        unexecuted = [
+            proposal(state, call["name"], prepared(call), PROPOSAL_REJECTED,
+                     "Tool-round limit reached.")
+            for call in getattr(state["messages"][-1], "tool_calls", None) or []
+        ]
+        return {"round_limit_reached": True,
+                "model_proposals": [*state["model_proposals"], *unexecuted]}
 
     async def synthesize(state: AgentState) -> dict:
         """Write the final answer from verified evidence with the tool-less model.
@@ -746,12 +952,14 @@ def build_graph(model: Any, client: Any, tools: list[Any], max_rounds: int = MAX
                 "answer_source": ANSWER_FROM_SYNTHESIS}
 
     graph = StateGraph(AgentState)
+    graph.add_node("resolve", resolve_accounts)
     graph.add_node("reason", reason)
     graph.add_node("tools", execute_tools)
     graph.add_node("followup", follow_up)
     graph.add_node("limit", limit)
     graph.add_node("synthesize", synthesize)
-    graph.add_edge(START, "reason")
+    graph.add_edge(START, "resolve")
+    graph.add_conditional_edges("resolve", after_resolve, {"tools": "tools", "reason": "reason"})
     graph.add_conditional_edges(
         "reason", route,
         {"done": END, "tools": "tools", "followup": "followup", "limit": "limit",
@@ -773,10 +981,11 @@ async def investigate(
     client: Any,
     tools: list[Any],
     max_rounds: int = MAX_TOOL_ROUNDS,
+    pre_resolve: bool = True,
 ) -> dict[str, Any]:
     if not question.strip() or len(question) > 4000:
         raise ValueError("question must contain 1-4000 non-whitespace characters")
-    graph = build_graph(model, client, tools, max_rounds)
+    graph = build_graph(model, client, tools, max_rounds, pre_resolve)
     result = await graph.ainvoke(
         {
             "messages": [HumanMessage(content=question)],
@@ -791,6 +1000,9 @@ async def investigate(
             "synthesis_attempted": False,
             "answer_source": ANSWER_FROM_MODEL,
             "answer_notice": None,
+            "model_turns": 0,
+            "model_proposals": [],
+            "model_turn_log": [],
         }
     )
     evidence = result["evidence"]
@@ -843,6 +1055,9 @@ async def investigate(
         "limited": limited_reason is not None,
         "limited_reason": limited_reason,
         "model_error": result["model_error"],
+        "model_proposals": result["model_proposals"],
+        "model_turns": result["model_turns"],
+        "model_turn_log": result["model_turn_log"],
     }
 
 
@@ -900,7 +1115,9 @@ def _deterministic_narrative(
 ) -> str:
     """A narrative with no model-generated claims; the record sections carry the facts."""
     if not records:
-        failed = any(not item["success"] for item in result["tool_trace"])
+        # Skipped duplicates and complete-list pages repeated earlier results; nothing failed.
+        failed = any(not item["success"] and not str(item.get("error") or "").startswith(
+            ("Duplicate call skipped", REDUNDANT_PAGE_ERROR)) for item in result["tool_trace"])
         return ("Lookup failed or insufficient" if failed else "Insufficient") + (
                 " verified evidence to answer reliably. "
                 "No matching records were retrieved. A successful tool request "

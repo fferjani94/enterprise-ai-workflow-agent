@@ -14,3 +14,6 @@ build/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Generated evaluation reports
+evals/results/

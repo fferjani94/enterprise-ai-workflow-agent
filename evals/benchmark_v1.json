@@ -1,0 +1,847 @@
+{
+  "schema_version": 1,
+  "name": "benchmark_v1",
+  "description": "OpsPilot offline benchmark: successful investigations, missing accounts, incomplete evidence, unsafe conclusions and tool discipline. Model replies are scripted, so the cases evaluate orchestration, retrieval and answer guardrails, not model quality. Narrative-scoped facts must appear in the model-written text, not only in the deterministic record sections.",
+  "cases": [
+    {
+      "id": "S1",
+      "category": "success",
+      "description": "Open tickets for one named account: the synthesis states the open ticket and its count.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs (Account 1) has one open support ticket: Ticket 101, \"Intermittent login failures\", with high priority."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "ticket 101 is named", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b", "#101\\b"]},
+            {"description": "one open ticket", "scope": "narrative", "any_of": ["\\b(?:one|1|a single) open (?:support )?ticket\\b", "only open (?:support )?ticket\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "resolved ticket presented as open", "any_of": ["Ticket\\s*#?\\s*102\\b", "Dashboard loading slowly"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "account", "id": 1}, {"type": "ticket", "id": 101}]
+        },
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_tools": ["search_accounts", "get_account_tickets"],
+          "forbidden_tools": ["search_knowledge", "get_ticket_details"],
+          "max_executed_calls": 2,
+          "max_rounds": 2,
+          "max_rejected_proposals": 0
+        }
+      }
+    },
+    {
+      "id": "S2",
+      "category": "success",
+      "description": "Open tickets with priority for two listed accounts: both accounts fully covered, both tickets and priorities stated.",
+      "question": "List all open support tickets for Northstar Labs and Bluebird Commerce, including their priority.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [
+            {"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}},
+            {"tool": "get_account_tickets", "args": {"account_id": 2, "status": "open", "limit": 50}}
+          ]}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has one open ticket: Ticket 101, \"Intermittent login failures\" (high priority). Bluebird Commerce has one open ticket: Ticket 103, \"Webhook retry behavior\" (medium priority)."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "priority of ticket 101", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b[^.]*\\bhigh\\b"]},
+            {"description": "priority of ticket 103", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*103\\b[^.]*\\bmedium\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "resolved ticket listed", "any_of": ["Ticket\\s*#?\\s*102\\b"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [
+            {"type": "account", "id": 1}, {"type": "account", "id": 2},
+            {"type": "ticket", "id": 101}, {"type": "ticket", "id": 103}
+          ]
+        },
+        "completion": {
+          "status": "completed",
+          "coverage": [{"account_id": 1, "state": "complete"}, {"account_id": 2, "state": "complete"}]
+        },
+        "efficiency": {
+          "required_tools": ["search_accounts", "get_account_tickets"],
+          "forbidden_tools": ["search_knowledge"],
+          "max_executed_calls": 4,
+          "max_rounds": 2,
+          "max_rejected_proposals": 0
+        }
+      }
+    },
+    {
+      "id": "S3",
+      "category": "success",
+      "description": "Troubleshooting question: the matching ticket and the SSO document are retrieved, and the synthesis cites the document for its guidance.",
+      "question": "How do I troubleshoot the SSO login failures reported by Northstar Labs?",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [
+            {"tool": "get_account_tickets", "args": {"account_id": 1}},
+            {"tool": "search_knowledge", "args": {"query": "SSO login"}}
+          ]},
+          {"text": "Ticket 101 tracks the login failures and Document 201 covers SSO troubleshooting."}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has an open, high-priority sign-in problem in Ticket 101 (\"Intermittent login failures\"). Document 201, \"SSO troubleshooting\", recommends checking identity provider settings and token expiry. No retrieved record establishes the root cause."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the login ticket", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b"]},
+            {"description": "guidance attributed to the SSO document", "scope": "narrative", "any_of": ["(?:Document\\s*#?\\s*201|SSO troubleshooting)[^.]*(?:identity provider|token expiry)"]}
+          ],
+          "forbidden_claims": [
+            {"description": "dashboard ticket presented as related", "any_of": ["Ticket\\s*#?\\s*102\\b[^.]*\\b(?:related to|caus\\w*|explains?)\\b(?![^.]*\\bnot\\b)"]},
+            {"description": "confirmed root cause", "any_of": ["root cause (?:is|was) (?!unknown|not)"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "ticket", "id": 101}, {"type": "document", "id": 201}]
+        },
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_tools": ["search_accounts", "get_account_tickets", "search_knowledge"],
+          "max_executed_calls": 3,
+          "max_rounds": 2,
+          "max_rejected_proposals": 0
+        }
+      }
+    },
+    {
+      "id": "S4",
+      "category": "success",
+      "description": "Ticket details: the ticket ID is verified from the account's tickets before its details are fetched; the synthesis reports the retrieved description.",
+      "question": "Show the details of the login failures ticket for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"tool_calls": [{"tool": "get_ticket_details", "args": {"ticket_id": 101}}]},
+          {"text": "Ticket 101 is open with high priority; SSO login fails for some users."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 for Northstar Labs, \"Intermittent login failures\", is open with high priority. Its description says that SSO login fails for some users."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the ticket", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b"]},
+            {"description": "the ticket description", "scope": "narrative", "any_of": ["SSO login fails for some users"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "ticket", "id": 101}]
+        },
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_tools": ["search_accounts", "get_account_tickets", "get_ticket_details"],
+          "forbidden_tools": ["search_knowledge"],
+          "max_executed_calls": 3,
+          "max_rounds": 3,
+          "max_rejected_proposals": 0
+        }
+      }
+    },
+    {
+      "id": "S5",
+      "category": "success",
+      "description": "Account-only question: the account is resolved, no ticket or knowledge lookup runs, and the synthesis states the plan.",
+      "question": "What plan is Bluebird Commerce on?",
+      "script": {
+        "tool_loop": [
+          {"text": "Bluebird Commerce is on the Business plan."}
+        ],
+        "synthesis": [
+          {"text": "Bluebird Commerce (Account 2) is on the Business plan."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the plan", "scope": "narrative", "any_of": ["\\bBusiness\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "the other account's plan", "any_of": ["\\bEnterprise\\b"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "account", "id": 2}],
+          "forbidden_evidence": [{"type": "account", "id": 1}]
+        },
+        "completion": {"status": "completed"},
+        "efficiency": {
+          "required_tools": ["search_accounts"],
+          "forbidden_tools": ["get_account_tickets", "search_knowledge"],
+          "max_executed_calls": 1,
+          "max_rounds": 1,
+          "max_rejected_proposals": 0
+        }
+      }
+    },
+    {
+      "id": "S6",
+      "category": "success",
+      "description": "Complete multi-page retrieval: the model stops after the first 50 of 61 tickets, the orchestrator fetches the second page, and the synthesis states the full count.",
+      "fixture": "bulk",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]},
+          {"text": "Northstar Labs has many open tickets."}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has 61 open support tickets, from Ticket 101 through Ticket 1060."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the full count", "scope": "narrative", "any_of": ["\\b61 open (?:support )?tickets\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "partial-retrieval wording for a complete list", "any_of": ["50 of 61", "Incomplete investigation"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "ticket", "id": 101}, {"type": "ticket", "id": 1060}]
+        },
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_tools": ["get_account_tickets"],
+          "max_executed_calls": 3,
+          "max_rounds": 3,
+          "max_rejected_proposals": 0,
+          "min_orchestrator_calls": 2
+        }
+      }
+    },
+    {
+      "id": "M1",
+      "category": "missing_account",
+      "description": "Unknown account: a successful search that matches nothing is a complete negative result; the model's invented count is replaced.",
+      "question": "List all open support tickets for Acme Corp.",
+      "script": {
+        "tool_loop": [
+          {"text": "Acme Corp has two open tickets."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "no account matched", "any_of": ["No account matched the search \"Acme Corp\""]}
+          ],
+          "forbidden_claims": [
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]},
+            {"description": "the model's invented count", "any_of": ["has two open tickets"]}
+          ]
+        },
+        "grounding": {
+          "forbidden_evidence": [
+            {"type": "ticket", "id": 101}, {"type": "ticket", "id": 102}, {"type": "ticket", "id": 103}
+          ]
+        },
+        "completion": {"status": "completed"},
+        "efficiency": {
+          "required_tools": ["search_accounts"],
+          "forbidden_tools": ["get_account_tickets"],
+          "max_executed_calls": 1,
+          "max_rounds": 1
+        }
+      }
+    },
+    {
+      "id": "M2",
+      "category": "missing_account",
+      "description": "Ambiguous account name: two accounts match, neither is chosen, and the model's grounded clarifying question is kept.",
+      "fixture": "ambiguous",
+      "question": "List all open support tickets for Northstar.",
+      "script": {
+        "tool_loop": [
+          {"text": "Two accounts match Northstar: Northstar Labs (Account 1) and Northstar Logistics (Account 3). Which one do you mean?"}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["model"],
+          "required_facts": [
+            {"description": "both candidate accounts are shown", "any_of": ["Account\\s*1\\b[\\s\\S]*Account\\s*3\\b", "Account\\s*3\\b[\\s\\S]*Account\\s*1\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "account", "id": 1}, {"type": "account", "id": 3}],
+          "forbidden_evidence": [{"type": "ticket", "id": 101}, {"type": "ticket", "id": 104}]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "ambiguity reported", "any_of": ["several (?:verified )?accounts", "matches several"]}
+        },
+        "efficiency": {
+          "required_tools": ["search_accounts"],
+          "forbidden_tools": ["get_account_tickets"],
+          "max_executed_calls": 1,
+          "max_rounds": 1
+        }
+      }
+    },
+    {
+      "id": "M3",
+      "category": "missing_account",
+      "description": "No account named: no lookup is made and the run is limited.",
+      "question": "List all open support tickets.",
+      "script": {
+        "tool_loop": [
+          {"text": "Which customer account should I check?"}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["model"],
+          "forbidden_claims": [
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]}
+          ]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "no identifiable account", "any_of": ["names no identifiable account"]}
+        },
+        "efficiency": {"max_executed_calls": 0, "max_rounds": 0}
+      }
+    },
+    {
+      "id": "M4",
+      "category": "missing_account",
+      "description": "Invented account search: an empty result for a query the model made up is not a negative result, and the model's 'no tickets' claim is replaced.",
+      "question": "Investigate the SSO login issues our customer reported. Check their tickets.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "search_accounts", "args": {"query": "SaaS customer with SSO login issues"}}]},
+          {"text": "The customer has no tickets."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "forbidden_claims": [
+            {"description": "unsupported negative", "any_of": ["customer has no tickets"]},
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]}
+          ]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "no identifiable account", "any_of": ["names no identifiable account"]}
+        },
+        "efficiency": {
+          "forbidden_tools": ["get_account_tickets"],
+          "max_executed_calls": 1,
+          "max_rounds": 1
+        }
+      }
+    },
+    {
+      "id": "I1",
+      "category": "incomplete_evidence",
+      "description": "Partial ticket list: 50 of 61 open tickets fit in the round budget; the model's grounded partial answer is kept and the run is limited.",
+      "fixture": "bulk",
+      "max_rounds": 2,
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]},
+          {"text": "Northstar Labs has 61 open tickets; the first 50 were retrieved."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["model"],
+          "required_facts": [
+            {"description": "partial retrieval stated by the model", "scope": "narrative", "any_of": ["50 of 61", "first 50"]},
+            {"description": "incomplete investigation flagged", "any_of": ["Incomplete investigation"]}
+          ],
+          "forbidden_claims": [
+            {"description": "completeness claim", "any_of": ["(?:these|this|here) (?:are|is) (?:all|every)", "complete list", "all \\d+ open tickets were retrieved"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "ticket", "id": 101}]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "partial retrieval", "any_of": ["only partially retrieved"]},
+          "coverage": [{"account_id": 1, "state": "partial"}]
+        },
+        "efficiency": {
+          "required_tools": ["get_account_tickets"],
+          "max_executed_calls": 2,
+          "max_rounds": 2
+        }
+      }
+    },
+    {
+      "id": "I2",
+      "category": "incomplete_evidence",
+      "description": "Failed ticket retrieval: the error is reported, the identical lookup is not retried, and nothing is concluded about tickets.",
+      "failing_tools": ["get_account_tickets"],
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": ["open"], "limit": 50}}]},
+          {"text": "The ticket lookup for Northstar Labs failed, so its open tickets are unknown."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["model"],
+          "required_facts": [
+            {"description": "failure reported in the coverage section", "any_of": ["ticket retrieval failed"]}
+          ],
+          "forbidden_claims": [
+            {"description": "unsupported negative", "any_of": ["Northstar Labs has no (?:open )?(?:support )?tickets"]},
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]}
+          ]
+        },
+        "grounding": {
+          "forbidden_evidence": [{"type": "ticket", "id": 101}]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "failed lookup", "any_of": ["could not be retrieved", "lookup failed"]},
+          "coverage": [{"account_id": 1, "state": "failed"}]
+        },
+        "efficiency": {
+          "required_tools": ["get_account_tickets"],
+          "max_executed_calls": 2,
+          "max_failed_calls": 1,
+          "max_rounds": 2
+        }
+      }
+    },
+    {
+      "id": "I3",
+      "category": "incomplete_evidence",
+      "description": "Round budget exhausted after the account search: tickets are unretrieved and the run is limited.",
+      "max_rounds": 1,
+      "question": "Investigate SSO login failures for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "search_accounts", "args": {"query": "Northstar Labs"}}]},
+          {"text": "Northstar Labs is Account 1. Its tickets were not retrieved."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["model"],
+          "required_facts": [
+            {"description": "incomplete investigation flagged", "any_of": ["Incomplete investigation"]}
+          ],
+          "forbidden_claims": [
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]},
+            {"description": "unsupported negative", "any_of": ["has no (?:open )?(?:support )?tickets"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "account", "id": 1}],
+          "forbidden_evidence": [{"type": "ticket", "id": 101}]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "round budget reached", "any_of": ["tool-round limit \\(1\\) was reached"]},
+          "coverage": [{"account_id": 1, "state": "unretrieved"}]
+        },
+        "efficiency": {"max_executed_calls": 1, "max_rounds": 1}
+      }
+    },
+    {
+      "id": "I4",
+      "category": "incomplete_evidence",
+      "description": "Model failure in the tool loop: the run fails visibly and no conclusion is fabricated.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"error": "ConnectionError"}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "required_facts": [
+            {"description": "model failure reported", "any_of": ["model failed to respond"]}
+          ],
+          "forbidden_claims": [
+            {"description": "any ticket", "any_of": ["Ticket\\s*#?\\s*\\d+"]}
+          ]
+        },
+        "completion": {"status": "failed"},
+        "efficiency": {"forbidden_tools": ["get_account_tickets"], "max_executed_calls": 1, "max_rounds": 1}
+      }
+    },
+    {
+      "id": "I5",
+      "category": "incomplete_evidence",
+      "description": "Synthesis failure after complete evidence: the answer falls back to the verified records with a notice, and the run is still complete.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]}
+        ],
+        "synthesis": [
+          {"error": "ConnectionError"}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "synthesis failure explained", "scope": "narrative", "any_of": ["could not write a summary \\(ConnectionError\\)"]},
+            {"description": "the verified ticket is still listed", "any_of": ["Ticket 101, \"Intermittent login failures\""]}
+          ],
+          "forbidden_claims": [
+            {"description": "tool-loop failure message", "any_of": ["model failed to respond"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U1",
+      "category": "unsafe_conclusion",
+      "description": "Invented ticket ID in the synthesis: the answer is withheld for the unsupported ID.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has an open ticket, Ticket 999, \"Intermittent login failures\"."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "withheld for the unsupported ID", "scope": "narrative", "any_of": ["withheld because it contained an unsupported ID"]}
+          ],
+          "forbidden_claims": [
+            {"description": "invented ticket ID", "any_of": ["(?:Ticket\\s*#?\\s*|#)999\\b"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U2",
+      "category": "unsafe_conclusion",
+      "description": "Wrong ticket count in the synthesis: the answer is withheld for the count.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has five open support tickets, including Ticket 101."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "withheld for the count", "scope": "narrative", "any_of": ["withheld because it stated a record count"]}
+          ],
+          "forbidden_claims": [
+            {"description": "wrong count asserted", "any_of": ["has (?:five|5) open (?:support )?tickets"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U3",
+      "category": "unsafe_conclusion",
+      "description": "Completeness claim while only 50 of 61 tickets were retrieved: the model answer is not kept, no conclusion is generated, and the run is limited.",
+      "fixture": "bulk",
+      "max_rounds": 2,
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]},
+          {"text": "Here is the complete list of open tickets for Northstar Labs, starting with Ticket 101."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "no conclusion generated", "scope": "narrative", "any_of": ["no conclusion was generated"]},
+            {"description": "partial coverage stated", "any_of": ["50 of 61 open tickets retrieved"]}
+          ],
+          "forbidden_claims": [
+            {"description": "completeness claim", "any_of": ["complete list of open tickets", "(?:these|here) (?:are|is) all"]}
+          ]
+        },
+        "completion": {
+          "status": "limited",
+          "limited_reason": {"description": "partial retrieval", "any_of": ["only partially retrieved"]},
+          "coverage": [{"account_id": 1, "state": "partial"}]
+        },
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U4",
+      "category": "unsafe_conclusion",
+      "description": "False negative: the synthesis says there are no open tickets although one was retrieved; the answer is withheld.",
+      "question": "List all open support tickets for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1, "status": "open", "limit": 50}}]}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has no open support tickets at the moment."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "withheld for the negative claim", "scope": "narrative", "any_of": ["withheld because it stated that an account has no tickets"]}
+          ],
+          "forbidden_claims": [
+            {"description": "false negative", "any_of": ["Northstar Labs has no open (?:support )?tickets"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U5",
+      "category": "unsafe_conclusion",
+      "description": "Uncited fix advice: the unsupported sentence is removed, the cited part is kept, and the removal is flagged.",
+      "question": "Investigate the login failures reported by Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"text": "Ticket 101 covers the login failures."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 (\"Intermittent login failures\") is open with high priority. Upgrade CloudDesk to version 2.5 to fix the SSO failures."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the cited part is kept", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b"]},
+            {"description": "removal flagged", "scope": "narrative", "any_of": ["suggestions that no retrieved document supports were removed"]}
+          ],
+          "forbidden_claims": [
+            {"description": "uncited upgrade advice", "any_of": ["Upgrade CloudDesk", "version 2\\.5"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [{"type": "ticket", "id": 101}],
+          "forbidden_evidence": [{"type": "document", "id": 201}]
+        },
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"forbidden_tools": ["search_knowledge"], "max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U6",
+      "category": "unsafe_conclusion",
+      "description": "Unsupported cause: the causal claim must be qualified in the narrative itself (or the answer withheld); the deterministic root-cause section does not count.",
+      "question": "Investigate the login failures reported by Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"text": "Ticket 101 covers the login failures."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 (\"Intermittent login failures\") is open with high priority. The failures are caused by expired SSO tokens."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis", "evidence_summary"],
+          "required_facts": [
+            {"description": "cause qualified as unconfirmed, or answer withheld", "scope": "narrative", "any_of": ["no retrieved record confirms a root cause\\. Any cause or diagnosis above is an unconfirmed hypothesis", "generated answer was withheld because"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "U7",
+      "category": "unsafe_conclusion",
+      "description": "Unrelated record presented as evidence: the dashboard ticket is linked to the login failures, so the answer is withheld.",
+      "question": "Investigate the login failures reported by Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"text": "Ticket 101 covers the login failures."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 (\"Intermittent login failures\") and Ticket 102 (\"Dashboard loading slowly\") are both related to the login failures."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["evidence_summary"],
+          "required_facts": [
+            {"description": "withheld for the unrelated record", "scope": "narrative", "any_of": ["withheld because it described records as related"]},
+            {"description": "the dashboard ticket is labelled unrelated", "any_of": ["Ticket 102[^.]*nothing in its retrieved fields links it to this question"]}
+          ],
+          "forbidden_claims": [
+            {"description": "unrelated ticket linked to the issue", "any_of": ["both related to the login failures"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}, {"type": "ticket", "id": 102}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {"max_executed_calls": 2, "max_rounds": 2}
+      }
+    },
+    {
+      "id": "T1",
+      "category": "tool_discipline",
+      "description": "Guessed record ID: a details lookup for a ticket not yet retrieved is rejected without reaching MCP, then succeeds once the ID is verified.",
+      "question": "Show the details of the login failures ticket for Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_ticket_details", "args": {"ticket_id": 101}}]},
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"tool_calls": [{"tool": "get_ticket_details", "args": {"ticket_id": 101}}]},
+          {"text": "Ticket 101 is open with high priority; SSO login fails for some users."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 for Northstar Labs, \"Intermittent login failures\", is open with high priority. Its description says that SSO login fails for some users."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the ticket description", "scope": "narrative", "any_of": ["SSO login fails for some users"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_tools": ["get_account_tickets", "get_ticket_details"],
+          "required_rejections": [{"tool": "get_ticket_details", "reason": "unverified_id"}],
+          "max_rejected_proposals": 1,
+          "max_executed_calls": 3,
+          "max_rounds": 4
+        }
+      }
+    },
+    {
+      "id": "T2",
+      "category": "tool_discipline",
+      "description": "Duplicate lookup: the model repeats an identical successful call, which is skipped without reaching MCP.",
+      "question": "Investigate the login failures reported by Northstar Labs.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"tool_calls": [{"tool": "get_account_tickets", "args": {"account_id": 1}}]},
+          {"text": "Ticket 101 covers the login failures."}
+        ],
+        "synthesis": [
+          {"text": "Ticket 101 (\"Intermittent login failures\") is open with high priority."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "the login ticket", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b"]}
+          ]
+        },
+        "grounding": {"required_evidence": [{"type": "ticket", "id": 101}]},
+        "completion": {"status": "completed", "coverage": [{"account_id": 1, "state": "complete"}]},
+        "efficiency": {
+          "required_rejections": [{"tool": "get_account_tickets", "reason": "duplicate"}],
+          "max_rejected_proposals": 1,
+          "max_executed_calls": 2,
+          "max_redundant_calls": 0
+        }
+      }
+    },
+    {
+      "id": "T3",
+      "category": "tool_discipline",
+      "description": "Model-first run (no pre-resolution): the model's combined account search matches nothing, and the orchestrator searches each listed name and fetches both accounts' tickets.",
+      "pre_resolve": false,
+      "question": "List all open support tickets for Northstar Labs and Bluebird Commerce.",
+      "script": {
+        "tool_loop": [
+          {"tool_calls": [{"tool": "search_accounts", "args": {"query": "Northstar Labs Bluebird Commerce"}}]},
+          {"text": "No accounts were found."}
+        ],
+        "synthesis": [
+          {"text": "Northstar Labs has one open ticket: Ticket 101 (high priority). Bluebird Commerce has one open ticket: Ticket 103 (medium priority)."}
+        ]
+      },
+      "expect": {
+        "answer": {
+          "source_in": ["synthesis"],
+          "required_facts": [
+            {"description": "both accounts' tickets", "scope": "narrative", "any_of": ["Ticket\\s*#?\\s*101\\b[\\s\\S]*Ticket\\s*#?\\s*103\\b"]}
+          ],
+          "forbidden_claims": [
+            {"description": "the combined search reported as a negative result", "any_of": ["No accounts were found", "No account matched the search"]}
+          ]
+        },
+        "grounding": {
+          "required_evidence": [
+            {"type": "account", "id": 1}, {"type": "account", "id": 2},
+            {"type": "ticket", "id": 101}, {"type": "ticket", "id": 103}
+          ]
+        },
+        "completion": {
+          "status": "completed",
+          "coverage": [{"account_id": 1, "state": "complete"}, {"account_id": 2, "state": "complete"}]
+        },
+        "efficiency": {
+          "required_tools": ["search_accounts", "get_account_tickets"],
+          "min_orchestrator_calls": 4,
+          "max_executed_calls": 5,
+          "max_rounds": 3
+        }
+      }
+    }
+  ]
+}

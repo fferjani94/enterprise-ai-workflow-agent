@@ -4,9 +4,10 @@ Fictional SaaS customer support investigation agent, using FastAPI, SQLite/SQLAl
 Alembic, MCP, LangGraph, optional local Ollama inference, and a dependency-free web
 dashboard.
 
-**Status:** Milestone 5 complete (version 0.5.0). The dashboard, investigation API, CLI and
-MCP tools work end to end **on a local machine** with a local Ollama model and the seeded
-SQLite database. The project is **not production-ready**: see
+**Status:** Milestone 5 complete (version 0.5.0), plus the Milestone 6A offline evaluation
+benchmark ([Offline evaluation](#offline-evaluation-milestone-6a)). The dashboard,
+investigation API, CLI and MCP tools work end to end **on a local machine** with a local
+Ollama model and the seeded SQLite database. The project is **not production-ready**: see
 [Production deployment limitations](#production-deployment-limitations).
 
 ## Run locally on Windows (PowerShell)
@@ -94,6 +95,68 @@ further requests queue).
 `qwen2.5:3b` is a small starting model; tool-calling accuracy and response quality vary.
 If resources allow, try a larger tool-capable model. Ollama model downloads can take
 multiple GB of disk space. Confirm free space before pulling weights.
+
+## Offline evaluation (Milestone 6A)
+
+```powershell
+.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.evaluation              # all cases
+.venv\Scripts\python.exe -m enterprise_ai_workflow_agent.evaluation --case U3     # one case
+```
+
+Runs the versioned benchmark [`evals/benchmark_v1.json`](evals/benchmark_v1.json) (25 cases:
+6 successful investigations, 4 missing accounts, 5 incomplete evidence, 7 unsafe
+conclusions, 3 tool-discipline cases) and writes `evals/results/benchmark_v1-offline.{json,md}`
+(git-ignored). Runs filtered with `--case` write `...-offline-subset-<IDs>.{json,md}` and
+never overwrite the full-suite report. Reports record the benchmark's content SHA-256 and
+which cases ran. The exit code is 1 if any case fails; failures print the case ID,
+expected vs observed values and the tool trace. A case that raises is reported as a
+failure (`run_completed`) and the remaining cases still run. The same cases run in
+`pytest` (`tests/test_evaluation.py`), and every case must pass.
+
+Each case runs the real LangGraph agent against the **real MCP server in memory** on its
+own SQLite fixture with explicit record IDs (`evaluation/harness.py`; production seeding is
+not used). The model is **scripted**: tool-loop and synthesis replies come from the case.
+No Ollama, network or subprocess is needed, and reports contain no timings, so repeated
+runs are identical. A script that runs out of replies, or has replies left over, fails the
+case, so a case cannot pass on a graph path that never requested its scripted text.
+
+The benchmark covers pre-resolved and model-first (`pre_resolve: false`) runs, multi-page
+ticket retrieval, rejected guessed IDs and skipped duplicate calls, failed lookups, the
+round limit, tool-loop and synthesis failures, and seven unsupported-conclusion guards.
+`tests/test_evaluation.py` disables each of those guards in turn (mutation tests) and
+checks that the corresponding case fails, and checks that replacing a synthesis with
+generic text fails every case whose answer must come from synthesis.
+
+Metrics, per case and aggregated per category (`evaluation/metrics.py`):
+
+| Dimension | Checks and metrics |
+|---|---|
+| Answer correctness | required facts present (fact recall), forbidden claims absent, expected answer source; share of unsafe cases blocked. Facts are scoped to the **narrative** (model-written text, or the deterministic notice when the answer was withheld) or to the whole **answer** including the rule-generated record sections |
+| Evidence grounding | **citation validity**, scored separately for model-written text and for the whole answer: every cited ID was retrieved with the same record type (`Ticket 101`, `Tickets 101 and 103`, `Ticket IDs: 101, 103`, or `#101` when exactly one retrieved record has that ID); **evidence retrieval** (required records retrieved, forbidden ones not); unsupported-claim count in model-written text |
+| Task completion | `completed`/`limited`/`failed` status, limitation reason, per-account ticket coverage |
+| Tool efficiency | required/forbidden tools, executed-call and round budgets, failed and redundant (identical) calls, rejected proposals by tool and reason, minimum orchestrator follow-ups |
+
+Expectations accept equivalent wording (each fact lists alternative regexes) and use upper
+bounds rather than exact call sequences. Limitations:
+
+- Scripted replies test orchestration, retrieval and answer guardrails, **not model
+  quality**. Live-model evaluation (repeated runs against Ollama) is future work.
+- All checks are lexical. They detect the specific claims each case names; they are **not
+  general hallucination detection**. A wrong statement that no pattern covers goes
+  unnoticed, and a narrative fact only shows that the expected wording is present, not
+  that the rest of the narrative is true.
+- Citation parsing is heuristic: a typeless `#N` that matches records of several types is
+  reported as ambiguous and not scored; IDs written without `#` or a record type ("see
+  101") are not recognised; a number listed after an ID ("Ticket 101, 2 users") is read as
+  a second ID.
+- The unsupported-claim metric reuses the agent's own grounding detectors, so it guards
+  against regressions but is not an independent judge.
+- Runs patch module-level MCP server state (restored on exit, including after exceptions)
+  and must not run concurrently.
+
+Add a case by appending it to `evals/benchmark_v1.json` (the schema is in
+`evaluation/dataset.py`). Use `--verbose` to see agent logs. Changing the meaning of
+existing cases calls for a new benchmark version rather than an edit.
 
 ## Architecture
 

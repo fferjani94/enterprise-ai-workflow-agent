@@ -1,5 +1,6 @@
 """Static UI delivery and the contract between the frontend and the backend."""
 
+import json
 import re
 import shutil
 import subprocess
@@ -163,3 +164,51 @@ def test_trace_entries_without_arguments_are_not_rendered_as_null():
     assert ToolTraceEntry(**limited).model_dump(mode="json")["arguments"] is None
     assert "entry.arguments == null" in JS
     assert "entry.arguments === undefined" not in JS
+
+
+STEP_STATUS_CASES = [
+    # (trace entry, expected dashboard status)
+    ({"success": True, "executed": True, "outcome": "executed_success"}, "ok"),
+    ({"success": False, "executed": True, "outcome": "executed_error"}, "fail"),
+    ({"success": False, "executed": True, "outcome": "invalid_arguments"}, "invalid"),
+    ({"success": False, "executed": False, "outcome": "invalid_arguments"}, "invalid"),
+    ({"success": False, "executed": False, "outcome": "duplicate_rejected"}, "skipped"),
+    ({"success": False, "executed": False, "outcome": "unverified_id_rejected"}, "skipped"),
+    ({"success": False, "executed": False, "outcome": "redundant_page_rejected"}, "skipped"),
+    ({"success": False, "executed": False, "outcome": "call_limit_rejected"}, "skipped"),
+    ({"success": False, "executed": False, "outcome": "unknown_tool"}, "skipped"),
+    # Older traces without `outcome`.
+    ({"success": True}, "ok"),
+    ({"success": False, "executed": False}, "skipped"),
+    ({"success": False, "executed": True}, "fail"),
+    ({"success": False}, "fail"),
+    ({"success": False, "executed": None}, "fail"),
+]
+
+
+def _step_status_source():
+    start = JS.index("  function stepStatus(entry) {")
+    return JS[start:JS.index("\n  }\n", start) + 4]
+
+
+def test_every_dashboard_status_has_a_badge_and_a_style():
+    css = (WEB_DIR / "static" / "app.css").read_text(encoding="utf-8")
+    badges = JS.split("const STEP_BADGES = {")[1].split("};")[0]
+    statuses = {expected for _, expected in STEP_STATUS_CASES}
+    assert set(re.findall(r"^\s+(\w+): \['", badges, re.M)) == statuses
+    for status in statuses:
+        assert f".step-card.{status}" in css, status
+    assert "invalid: ['badge-warn', 'Invalid arguments']" in badges
+    assert "skipped: ['badge-muted', 'Skipped']" in badges
+    assert "fail: ['badge-fail', 'Failed']" in badges
+    assert "latency_ms" in JS and "latency_ms" in ToolTraceEntry.model_fields
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed")
+def test_dashboard_status_mapping_runs_as_expected():
+    script = (_step_status_source() + "\nconst cases = " + json.dumps(
+        [entry for entry, _ in STEP_STATUS_CASES])
+        + ";\nprocess.stdout.write(JSON.stringify(cases.map(stepStatus)));\n")
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [expected for _, expected in STEP_STATUS_CASES]

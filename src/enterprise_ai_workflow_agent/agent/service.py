@@ -2,10 +2,10 @@
 
 import asyncio
 import contextlib
-import functools
 import logging
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -14,6 +14,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from enterprise_ai_workflow_agent.agent.graph import investigate
+from enterprise_ai_workflow_agent.agent.telemetry import InvestigationRecorder
 from enterprise_ai_workflow_agent.core.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -28,12 +29,16 @@ AgentRunner = Callable[[str, str, int], Awaitable[dict[str, Any]]]
 
 
 class InvestigationError(Exception):
-    """An expected failure with a client-safe code and message."""
+    """An expected failure with a client-safe code and message.
 
-    def __init__(self, code: str, message: str) -> None:
+    `metrics`: partial diagnostics (timings and counts only), when safely available.
+    """
+
+    def __init__(self, code: str, message: str, metrics: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.metrics = metrics
 
 
 def build_chat_model(settings: Settings, model_name: str) -> Any:
@@ -101,9 +106,11 @@ async def check_ollama(
 
 
 async def run_agent(
-    settings: Settings, question: str, model_name: str, max_rounds: int
+    settings: Settings, question: str, model_name: str, max_rounds: int,
+    recorder: InvestigationRecorder | None = None,
 ) -> dict[str, Any]:
     """One investigation: one chat model and one MCP session, both closed on exit."""
+    recorder = recorder if recorder is not None else InvestigationRecorder()
     try:
         model = build_chat_model(settings, model_name)
     except ImportError:
@@ -111,17 +118,24 @@ async def run_agent(
             "ollama_integration_missing",
             'The Ollama integration is not installed. Run: pip install -e ".[agent]"',
         ) from None
-    await check_ollama(
-        settings.ollama_base_url, model_name, settings.ollama_preflight_timeout_seconds
-    )
+    with recorder.phase("preflight"):
+        await check_ollama(
+            settings.ollama_base_url, model_name, settings.ollama_preflight_timeout_seconds
+        )
     stage = "mcp"
+    started = recorder.now()
     try:
         async with mcp_session(settings) as client:
             tools = (await client.list_tools()).tools
             stage = "agent"
-            result = await investigate(question, model, client, tools, max_rounds=max_rounds)
-    except Exception as exc:
-        if stage != "mcp":
+            recorder.add_phase("mcp_startup", recorder.elapsed_ms(started))
+            result = await investigate(question, model, client, tools, max_rounds=max_rounds,
+                                       recorder=recorder)
+    except BaseException as exc:
+        if stage == "mcp":
+            # Startup failed or was cancelled (e.g. by the timeout): keep the time it took.
+            recorder.add_phase("mcp_startup", recorder.elapsed_ms(started))
+        if stage != "mcp" or not isinstance(exc, Exception):
             raise
         logger.exception("MCP server failed to start")
         raise InvestigationError(
@@ -138,8 +152,28 @@ async def run_agent(
             "The local model stopped responding after several attempts. Small local "
             "models fail intermittently, so try again. If it keeps failing, check the "
             "server logs and that Ollama can generate responses.",
+            metrics=recorder.safe_snapshot(partial=True),
         )
     return result
+
+
+def _with_service_timings(
+    metrics: Any, queue_wait_ms: float, total_ms: float
+) -> dict[str, Any] | None:
+    """Add service-level timings; best effort, the metrics are returned unchanged on failure."""
+    if not isinstance(metrics, dict):
+        return None
+    try:
+        timings = {**metrics.get("timings_ms", {}), "queue_wait": queue_wait_ms,
+                   "total": total_ms}
+        return {**metrics, "timings_ms": timings}
+    except Exception:
+        logger.debug("Service timings not added to metrics", exc_info=True)
+        return metrics
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)
 
 
 class _Job:
@@ -175,12 +209,14 @@ class InvestigationService:
 
     def __init__(self, settings: Settings, agent: AgentRunner | None = None) -> None:
         self.settings = settings
-        self._agent: AgentRunner = agent or functools.partial(run_agent, settings)
+        # None runs run_agent with a recorder owned here, so a timeout keeps partial metrics.
+        self._agent = agent
         self._slots = asyncio.Semaphore(settings.investigation_max_concurrency)
 
     async def run(self, question: str, model: str, max_rounds: int) -> dict[str, Any]:
         timeout = self.settings.investigation_timeout_seconds
         loop = asyncio.get_running_loop()
+        started = time.perf_counter()
         deadline = loop.time() + timeout
         try:
             await asyncio.wait_for(self._slots.acquire(), timeout)
@@ -195,6 +231,7 @@ class InvestigationService:
             raise InvestigationError(
                 "timeout", f"The investigation did not start within {timeout:g} seconds."
             )
+        queue_wait_ms = _elapsed_ms(started)
         job = _Job()
         work = asyncio.ensure_future(
             asyncio.to_thread(self._run_in_thread, question, model, max_rounds, remaining, job)
@@ -202,10 +239,16 @@ class InvestigationService:
         # The slot is released only when the thread has really finished.
         work.add_done_callback(self._finish)
         try:
-            return await asyncio.shield(work)
+            result = await asyncio.shield(work)
         except asyncio.CancelledError:
             job.cancel()
             raise
+        except InvestigationError as exc:
+            exc.metrics = _with_service_timings(exc.metrics, queue_wait_ms, _elapsed_ms(started))
+            raise
+        metrics = _with_service_timings(
+            result.get("metrics"), queue_wait_ms, _elapsed_ms(started))
+        return result if metrics is None else {**result, "metrics": metrics}
 
     def _finish(self, work: asyncio.Future) -> None:
         self._slots.release()
@@ -218,17 +261,25 @@ class InvestigationService:
         async def main() -> dict[str, Any]:
             if not job.attach(asyncio.get_running_loop(), asyncio.current_task()):
                 raise asyncio.CancelledError
+            recorder = InvestigationRecorder()
             try:
                 async with asyncio.timeout(timeout) as scope:
+                    if self._agent is None:
+                        return await run_agent(self.settings, question, model, max_rounds,
+                                               recorder)
                     return await self._agent(question, model, max_rounds)
             except TimeoutError:
                 if not scope.expired():
                     raise
+                # Best effort: whatever the run recorded while it unwound. A write that
+                # lands after this point is not reflected; a failed snapshot gives None.
                 raise InvestigationError(
                     "timeout",
                     f"The investigation did not finish within "
                     f"{self.settings.investigation_timeout_seconds:g} seconds. "
                     "Try a narrower question or fewer tool rounds.",
+                    metrics=recorder.safe_snapshot(partial=True) if recorder.has_data()
+                    else None,
                 ) from None
 
         factory = asyncio.ProactorEventLoop if sys.platform == "win32" else asyncio.new_event_loop

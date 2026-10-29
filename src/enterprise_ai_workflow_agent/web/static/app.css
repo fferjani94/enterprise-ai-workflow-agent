@@ -252,6 +252,8 @@ ul.md-list { list-style: disc; }
 .step-card { border: 1px solid var(--border); border-left-width: 3px; border-radius: 8px; background: var(--surface-2); }
 .step-card.ok { border-left-color: var(--ok); }
 .step-card.fail { border-left-color: var(--danger); }
+.step-card.skipped { border-left-color: var(--muted); }
+.step-card.invalid { border-left-color: var(--warn); }
 .step-card > summary { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 12px; cursor: pointer; list-style: none; }
 .step-index { flex: none; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: var(--border); font-size: 0.75rem; }
 .step-tool { font-family: var(--mono); font-weight: 600; }
@@ -264,6 +266,7 @@ ul.md-list { list-style: disc; }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .step-error { padding: 8px 12px; border-radius: 6px; background: var(--danger-soft); color: var(--danger); overflow-wrap: anywhere; }
+.step-note { padding: 8px 12px; border-radius: 6px; background: var(--surface); color: var(--muted); overflow-wrap: anywhere; }
 
 .result-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 

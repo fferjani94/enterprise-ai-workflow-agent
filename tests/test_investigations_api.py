@@ -9,11 +9,13 @@ import tomllib
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from enterprise_ai_workflow_agent import __version__
 from enterprise_ai_workflow_agent.agent.service import InvestigationError, InvestigationService
+from enterprise_ai_workflow_agent.agent.telemetry import InvestigationRecorder
 from enterprise_ai_workflow_agent.api.investigation_schemas import InvestigationRequest
 from enterprise_ai_workflow_agent.api.routes import investigations as routes
 from enterprise_ai_workflow_agent.api.routes.investigations import get_investigation_service
@@ -113,10 +115,111 @@ def test_successful_investigation_serialization():
     assert service.calls == [("Investigate SSO for Northstar Labs.", "qwen2.5:3b", 3)]
 
 
+def _sample_metrics(partial=False):
+    recorder = InvestigationRecorder(clock=iter([0.0, 1.25]).__next__)
+    with recorder.phase("graph"):
+        recorder.record_llm_attempt(stage="tool_loop", call=1, turn=1, attempt=1, outcome="ok",
+                                    latency_ms=500.0)
+        recorder.record_tool(tool="search_accounts", origin="model", trigger=None,
+                             outcome="duplicate_rejected", executed=False)
+    return recorder.snapshot(partial=partial)
+
+
+def test_metrics_and_trace_outcomes_are_exposed_additively(caplog):
+    trace = [{**TRACE[0], "outcome": "executed_success", "latency_ms": 12.5},
+             {**TRACE[1], "outcome": "unverified_id_rejected", "executed": False}]
+    service = FakeService()
+    service.result = {**service.result, "tool_trace": trace, "metrics": _sample_metrics()}
+    with caplog.at_level("INFO", logger=routes.logger.name):
+        body = post(service, {"question": "Investigate SSO for Northstar Labs."}).json()
+    assert body["metrics"] == service.result["metrics"]
+    assert body["tool_calls"] == 2
+    assert [e["outcome"] for e in body["tool_trace"]] == [
+        "executed_success", "unverified_id_rejected"]
+    assert body["tool_trace"][0]["latency_ms"] == 12.5
+    logged = [r.getMessage() for r in caplog.records if " metrics " in r.getMessage()]
+    assert len(logged) == 1
+    assert "Northstar" not in logged[0] and "llm_attempts" not in logged[0]
+    assert json.loads(logged[0].split(" metrics ", 1)[1])["tools"]["by_outcome"] == {
+        "duplicate_rejected": 1}
+
+
+def test_results_without_metrics_stay_compatible():
+    body = post(FakeService(), {"question": "Investigate"}).json()
+    assert body["metrics"] is None
+    assert all(entry["outcome"] is None for entry in body["tool_trace"])
+
+
+@pytest.mark.parametrize("code, status", [("timeout", 504), ("model_inference_failed", 503)])
+def test_failures_carry_partial_metrics(code, status):
+    error = InvestigationError(code, "Safe message.", metrics=_sample_metrics(partial=True))
+    response = post(FakeService(error=error), {"question": "Investigate"})
+    assert response.status_code == status
+    body = response.json()
+    assert body["error"] == {"code": code, "message": "Safe message.", "details": None}
+    assert body["metrics"]["partial"] is True
+    assert body["metrics"]["llm"]["attempts"] == 1
+
+
+def test_failures_without_metrics_report_null():
+    body = post(FakeService(error=InvestigationError("timeout", "Slow.")),
+                {"question": "Investigate"}).json()
+    assert body["metrics"] is None
+
+
+SECRET = "SENTINEL-c0ffee"
+INVALID_METRICS = [
+    {**_sample_metrics(), "llm": {"attempts": SECRET}},
+    {**_sample_metrics(), "schema_version": 99},
+    SECRET,
+    [SECRET],
+]
+
+
+@pytest.mark.parametrize("metrics", INVALID_METRICS)
+def test_invalid_metrics_are_omitted_from_a_successful_response(metrics, caplog):
+    service = FakeService()
+    service.result = {**service.result, "metrics": metrics}
+    with caplog.at_level("INFO", logger=routes.logger.name):
+        response = post(service, {"question": "Investigate"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["metrics"] is None
+    assert body["answer"] == service.result["answer"]
+    warnings = [r.getMessage() for r in caplog.records if "metrics omitted" in r.getMessage()]
+    assert len(warnings) == 1
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("metrics", INVALID_METRICS)
+def test_invalid_metrics_do_not_mask_an_error(metrics, caplog):
+    error = InvestigationError("timeout", "Safe message.", metrics=metrics)
+    with caplog.at_level("INFO", logger=routes.logger.name):
+        response = post(FakeService(error=error), {"question": "Investigate"})
+    assert response.status_code == 504
+    body = response.json()
+    assert body["error"] == {"code": "timeout", "message": "Safe message.", "details": None}
+    assert body["metrics"] is None
+    assert SECRET not in caplog.text
+
+
+def test_error_metrics_never_expose_exception_class_names():
+    recorder = InvestigationRecorder(clock=iter([0.0, 0.0]).__next__)
+    recorder.record_llm_attempt(stage="tool_loop", call=1, turn=1, attempt=1, outcome="error",
+                                latency_ms=3.0, error=httpx.ConnectError(f"refused {SECRET}"))
+    error = InvestigationError("ollama_unavailable", "Cannot reach the model.",
+                               metrics=recorder.snapshot(partial=True))
+    response = post(FakeService(error=error), {"question": "Investigate"})
+    assert response.status_code == 503
+    assert response.json()["metrics"]["llm_attempts"][0]["error_category"] == "connection"
+    assert "ConnectError" not in response.text and SECRET not in response.text
+
+
 def test_trace_and_evidence_are_preserved():
     body = post(FakeService(), {"question": "Investigate"}).json()
     defaults = {"error": None, "origin": "model", "reason": None, "adjustments": [],
-                "executed": None}
+                "executed": None, "outcome": None, "trigger": None, "latency_ms": None,
+                "error_category": None}
     assert body["tool_trace"] == [{**defaults, **entry} for entry in TRACE]
     assert body["tool_trace"][1]["error"].startswith("Unverified record ID")
     assert body["evidence"] == [{"relevance_basis": None, **record} for record in EVIDENCE]

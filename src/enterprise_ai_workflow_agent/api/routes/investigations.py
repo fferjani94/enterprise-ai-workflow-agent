@@ -1,20 +1,23 @@
 import asyncio
 import contextlib
+import json
 import logging
 import time
 import uuid
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from enterprise_ai_workflow_agent.agent.service import InvestigationError, InvestigationService
 from enterprise_ai_workflow_agent.api.investigation_schemas import (
     ErrorDetail,
     InvestigationConfig,
     InvestigationErrorResponse,
+    InvestigationMetrics,
     InvestigationRequest,
     InvestigationResponse,
 )
@@ -93,14 +96,38 @@ def _error_response(
     error: ErrorDetail,
     question: str | None = None,
     started: float | None = None,
+    metrics: InvestigationMetrics | None = None,
 ) -> JSONResponse:
     body = InvestigationErrorResponse(
         id=investigation_id,
         question=question,
         error=error,
         duration_seconds=round(time.perf_counter() - started, 3) if started else 0.0,
+        metrics=metrics,
     )
     return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
+
+
+def _metrics(investigation_id: str, raw: Any) -> InvestigationMetrics | None:
+    """Validated optional metrics, logged once; invalid telemetry is dropped, never fatal."""
+    if raw is None:
+        return None
+    try:
+        metrics = InvestigationMetrics.model_validate(raw)
+    except Exception as exc:
+        # Only the failure kind is logged: the values could be anything.
+        count = exc.error_count() if isinstance(exc, ValidationError) else None
+        logger.warning("Investigation %s metrics omitted: invalid telemetry (%s, %s error(s))",
+                       investigation_id, type(exc).__name__, count)
+        return None
+    try:
+        summary = metrics.model_dump(mode="json", exclude={
+            "llm_attempts": True, "tools": {"latency_by_tool"}})
+        logger.info("Investigation %s metrics %s", investigation_id,
+                    json.dumps(summary, sort_keys=True))
+    except Exception:
+        logger.warning("Investigation %s metrics could not be logged", investigation_id)
+    return metrics
 
 
 def _error_field(err: dict) -> str:
@@ -171,6 +198,7 @@ async def create_investigation(payload: InvestigationRequest, service: Service, 
             ErrorDetail(code=exc.code, message=exc.message),
             payload.question,
             started,
+            _metrics(investigation_id, getattr(exc, "metrics", None)),
         )
     except Exception:
         logger.exception("Investigation %s failed unexpectedly", investigation_id)
@@ -187,6 +215,7 @@ async def create_investigation(payload: InvestigationRequest, service: Service, 
     duration = round(time.perf_counter() - started, 3)
     trace = result["tool_trace"]
     logger.info("Investigation %s finished in %.2fs", investigation_id, duration)
+    metrics = _metrics(investigation_id, result.get("metrics"))
     return InvestigationResponse(
         id=investigation_id,
         question=payload.question,
@@ -207,4 +236,5 @@ async def create_investigation(payload: InvestigationRequest, service: Service, 
         model_turn_log=result.get("model_turn_log", []),
         evidence=result.get("evidence", []),
         analysis=result.get("analysis", {}),
+        metrics=metrics,
     )

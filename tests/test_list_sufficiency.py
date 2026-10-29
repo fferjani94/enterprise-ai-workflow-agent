@@ -25,6 +25,7 @@ from enterprise_ai_workflow_agent.agent.followups import (
     list_question_satisfied,
 )
 from enterprise_ai_workflow_agent.agent.graph import investigate
+from enterprise_ai_workflow_agent.agent.telemetry import InvestigationRecorder
 
 SYNTH = "Ticket 70 (high) and Ticket 80 (medium) are open."
 EXPLORE = "Investigate the open support tickets for Acme Widgets."
@@ -41,8 +42,10 @@ def tickets(account_id, status=None, limit=50, offset=0):
 
 def run(question, replies, client=None, max_rounds=4):
     client = client or Directory()
+    # A frozen clock keeps trace latencies equal across runs that are compared.
     result = asyncio.run(investigate(question, FakeModel(replies), client, TOOLS,
-                                     max_rounds=max_rounds))
+                                     max_rounds=max_rounds,
+                                     recorder=InvestigationRecorder(clock=lambda: 0.0)))
     return result, client
 
 
@@ -219,6 +222,7 @@ def test_redundant_page_in_the_same_batch_is_rejected_without_mcp():
     rejected = result["tool_trace"][-1]
     assert rejected["executed"] is False and rejected["success"] is False
     assert rejected["error"].startswith(REDUNDANT_PAGE_ERROR)
+    assert rejected["outcome"] == "redundant_page_rejected"
     assert "All 0 resolved or closed tickets for account 8" in rejected["error"]
     assert [p["outcome"] for p in result["model_proposals"]] == ["executed", "rejected"]
     assert result["ticket_coverage"][0]["state"] == "complete"

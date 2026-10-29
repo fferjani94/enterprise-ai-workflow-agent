@@ -410,8 +410,43 @@
       h('pre', { class: 'code-block' }, JSON.stringify(value, null, 2)));
   }
 
+  // `outcome` decides when present; older entries fall back to `executed` and `success`.
+  // Calls rejected before execution (duplicates, unverified IDs, limits) were skipped, not
+  // failed; entries without `executed` keep the previous Success/Failed display.
+  function stepStatus(entry) {
+    if (entry.success === true) return 'ok';
+    if (entry.outcome === 'invalid_arguments') return 'invalid';
+    if (entry.outcome === 'executed_error') return 'fail';
+    return entry.executed === false ? 'skipped' : 'fail';
+  }
+
+  const STEP_BADGES = {
+    ok: ['badge-ok', 'Success'],
+    skipped: ['badge-muted', 'Skipped'],
+    invalid: ['badge-warn', 'Invalid arguments'],
+    fail: ['badge-fail', 'Failed'],
+  };
+
+  const STEP_ERROR_TITLES = {
+    skipped: 'Why it was skipped',
+    invalid: 'Why the arguments were rejected',
+    fail: 'Error',
+  };
+
+  function stepMeta(entry, status) {
+    const parts = [];
+    if (status === 'ok' && Number.isInteger(entry.record_count)) {
+      parts.push(`${entry.record_count} record${entry.record_count === 1 ? '' : 's'}`);
+    }
+    if (typeof entry.latency_ms === 'number' && Number.isFinite(entry.latency_ms)) {
+      parts.push(`${Math.round(entry.latency_ms)} ms`);
+    }
+    return parts.length ? h('span', { class: 'step-meta' }, parts.join(' \u00b7 ')) : null;
+  }
+
   function renderStep(entry, index) {
-    const ok = entry.success === true;
+    const status = stepStatus(entry);
+    const [badgeClass, badgeText] = STEP_BADGES[status];
     const auto = entry.origin === 'orchestrator';
     const body = h('div', { class: 'step-body' });
     if (auto) {
@@ -432,29 +467,32 @@
         h('ul', { class: 'small' }, entry.adjustments.map((note) => h('li', {}, note)))));
     }
     if (entry.error) {
-      body.append(h('div', {}, h('h5', {}, 'Error'), h('p', { class: 'step-error' }, entry.error)));
+      body.append(h('div', {}, h('h5', {}, STEP_ERROR_TITLES[status] || 'Error'),
+        h('p', { class: status === 'fail' ? 'step-error' : 'step-note' }, entry.error)));
     }
     return h('li', {},
-      h('details', { class: `step-card ${ok ? 'ok' : 'fail'}` },
+      h('details', { class: `step-card ${status}` },
         h('summary', {},
           h('span', { class: 'step-index' }, String(index + 1)),
           h('span', { class: 'step-tool' }, entry.tool),
-          h('span', { class: `badge ${ok ? 'badge-ok' : 'badge-fail'}` }, ok ? 'Success' : 'Failed'),
+          h('span', { class: `badge ${badgeClass}` }, badgeText),
           auto ? h('span', { class: 'badge badge-muted', title: 'Added by the orchestrator' },
             'Auto') : null,
-          ok && Number.isInteger(entry.record_count)
-            ? h('span', { class: 'step-meta' },
-              `${entry.record_count} record${entry.record_count === 1 ? '' : 's'}`)
-            : null),
+          stepMeta(entry, status)),
         body));
   }
 
   function renderTimeline(trace) {
     const list = $('timeline');
     clear(list);
-    const failed = trace.filter((entry) => entry.success !== true).length;
+    const count = (status) => trace.filter((entry) => stepStatus(entry) === status).length;
+    const failed = count('fail');
+    const invalid = count('invalid');
+    const skipped = count('skipped');
     $('timeline-count').textContent = trace.length
       ? `${trace.length} call${trace.length === 1 ? '' : 's'}${failed ? `, ${failed} failed` : ''}`
+        + (invalid ? `, ${invalid} with invalid arguments` : '')
+        + (skipped ? `, ${skipped} skipped` : '')
       : 'no calls';
     $('toggle-steps').hidden = trace.length === 0;
     $('toggle-steps').textContent = 'Expand all steps';

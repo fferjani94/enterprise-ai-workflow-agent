@@ -1,5 +1,6 @@
 """Bounded, read-only LangGraph loop over an existing MCP client session."""
 
+import asyncio
 import json
 import logging
 import re
@@ -50,6 +51,28 @@ from enterprise_ai_workflow_agent.agent.grounding import (
     unsupported_no_ticket_claims,
 )
 from enterprise_ai_workflow_agent.agent.synthesis import SYNTHESIS_PROMPT, synthesis_input
+from enterprise_ai_workflow_agent.agent.telemetry import (
+    ATTEMPT_EMPTY,
+    ATTEMPT_ERROR,
+    ATTEMPT_OK,
+    ATTEMPT_TRANSIENT,
+    CALL_LIMIT_REJECTED,
+    CANCELLED,
+    DUPLICATE_REJECTED,
+    EXECUTED_ERROR,
+    EXECUTED_SUCCESS,
+    INVALID_ARGUMENTS,
+    REDUNDANT_PAGE_REJECTED,
+    SYNTHESIS_COMPLETED,
+    SYNTHESIS_FAILED,
+    SYNTHESIS_SKIPPED,
+    TRIGGER_FOLLOWUP,
+    TRIGGER_PRE_RESOLUTION,
+    UNKNOWN_TOOL,
+    UNVERIFIED_ID_REJECTED,
+    InvestigationRecorder,
+    error_category,
+)
 from enterprise_ai_workflow_agent.mcp_server.services import ticket_status_filter
 
 logger = logging.getLogger(__name__)
@@ -77,6 +100,9 @@ Only use record IDs returned by tools. Search knowledge without product_id if un
 # published in the tool schemas, and missing evidence is handled by the orchestrator.
 
 ORCHESTRATOR_CALL_PREFIX = "orchestrator-"
+PRE_RESOLUTION_CALL_PREFIX = f"{ORCHESTRATOR_CALL_PREFIX}resolve-"
+# Tool-loop attempts alternate with and without the system prompt (see reason()).
+TOOL_LOOP_PROMPT_VARIANTS = ("with_system", "without_system") * (MODEL_ATTEMPTS // 2)
 
 # Where the final narrative came from.
 ANSWER_FROM_MODEL = "model"  # the tool-calling model's own final answer
@@ -194,6 +220,20 @@ def clean_tool_error(name: str, text: str) -> str:
                                         "Check argument names, types and allowed ranges.")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:300] or "The tool reported an error without details."
+
+
+# FastMCP rejects arguments with a pydantic error for the generated "<tool>Arguments" model;
+# OpsPilot's services word argument errors as "<argument> must ..." (services.py).
+_ARGUMENT_VALIDATION = re.compile(r"^\d+ validation errors? for \w+Arguments\b")
+_ARGUMENT_ERROR = re.compile(r"^\w+ must\b")
+
+
+def tool_error_outcome(name: str, text: str) -> str:
+    """invalid_arguments for schema or service argument validation, else executed_error."""
+    text = text.replace(f"Error executing tool {name}: ", "", 1).strip()
+    if _ARGUMENT_VALIDATION.match(text) or _ARGUMENT_ERROR.match(text):
+        return INVALID_ARGUMENTS
+    return EXECUTED_ERROR
 
 
 
@@ -439,15 +479,21 @@ def _is_transient(exc: Exception) -> bool:
 async def _invoke_with_retries(
     runnable: Any, attempts: list[list[BaseMessage]], stage: str, allow_tool_calls: bool = False,
     malformed: list[dict[str, Any]] | None = None,
+    recorder: InvestigationRecorder | None = None, turn: int | None = None,
+    variants: tuple[str, ...] | None = None,
 ) -> tuple[Any | None, Exception | None]:
     """Invoke the model, retrying only transient failures, at most len(attempts) times.
 
     A reply with neither text nor (when allowed) tool calls counts as a transient failure:
     small local models occasionally return an empty message. Malformed tool calls of every
-    attempt are appended to `malformed`.
+    attempt are appended to `malformed`. Every attempt, including one interrupted by
+    cancellation, is recorded in `recorder`.
     """
     failure: Exception | None = None
+    call = recorder.start_llm_call() if recorder is not None else 0
     for made, messages in enumerate(attempts, start=1):
+        started = recorder.now() if recorder is not None else 0.0
+        reply, outcome, error = None, CANCELLED, None
         try:
             reply = await runnable.ainvoke(messages)
             if malformed is not None:
@@ -455,32 +501,48 @@ async def _invoke_with_retries(
             has_text = bool(str(getattr(reply, "content", "") or "").strip())
             if not has_text and not (allow_tool_calls and getattr(reply, "tool_calls", None)):
                 raise _EmptyReply("empty reply")
+            outcome = ATTEMPT_OK
         except Exception as exc:
             failure = exc
-            if not _is_transient(exc):
-                break
-            logger.warning("Transient model error during %s, attempt %d/%d%s: %s", stage,
-                           made, len(attempts), "; retrying" if made < len(attempts)
-                           else "; giving up", exc)
-        else:
+            if isinstance(exc, _EmptyReply):
+                outcome = ATTEMPT_EMPTY
+            else:
+                outcome = ATTEMPT_TRANSIENT if _is_transient(exc) else ATTEMPT_ERROR
+                error = exc
+        finally:
+            if recorder is not None:
+                recorder.record_llm_attempt(
+                    stage=stage.replace(" ", "_"), call=call, turn=turn, attempt=made,
+                    prompt_variant=variants[made - 1] if variants and made <= len(variants)
+                    else None,
+                    outcome=outcome, latency_ms=recorder.elapsed_ms(started), error=error,
+                    reply=reply)
+        if outcome == ATTEMPT_OK:
             if made > 1:
                 logger.info("Model recovered during %s on attempt %d/%d",
                             stage, made, len(attempts))
             return reply, None
+        if not _is_transient(failure):
+            break
+        logger.warning("Transient model error during %s, attempt %d/%d%s: %s", stage,
+                       made, len(attempts), "; retrying" if made < len(attempts)
+                       else "; giving up", failure)
     logger.error("Model %s failed: %s", stage, type(failure).__name__, exc_info=failure)
     return None, failure
 
 
 def build_graph(
     model: Any, client: Any, tools: list[Any], max_rounds: int = MAX_TOOL_ROUNDS,
-    pre_resolve: bool = True,
+    pre_resolve: bool = True, recorder: InvestigationRecorder | None = None,
 ):
     """Build graph; client must expose async call_tool(name, arguments).
 
     `pre_resolve=False` keeps the model-first path (baseline for evaluations).
+    `recorder` receives diagnostics only; nothing in the graph reads it back.
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be positive")
+    recorder = recorder if recorder is not None else InvestigationRecorder()
     tool_names = {tool.name for tool in tools}
     tool_schemas = {tool.name: tool.inputSchema for tool in tools}
     bound_model = model.bind_tools(_tool_specs(tools))
@@ -547,7 +609,7 @@ def build_graph(
             return {}
         calls = [
             {"name": item.tool, "args": item.arguments, "type": "tool_call",
-             "id": f"{ORCHESTRATOR_CALL_PREFIX}resolve-{index}"}
+             "id": f"{PRE_RESOLUTION_CALL_PREFIX}{index}"}
             for index, item in enumerate(searches)
         ]
         logger.info("Resolving named accounts before planning: %s",
@@ -572,9 +634,10 @@ def build_graph(
         # and without the system message (both verified to work with the five MCP schemas).
         attempts = [with_system, state["messages"]] * (MODEL_ATTEMPTS // 2)
         malformed: list[dict[str, Any]] = []
-        answer, failure = await _invoke_with_retries(
-            bound_model, attempts, "tool loop", allow_tool_calls=True, malformed=malformed)
         turn = state["model_turns"] + 1
+        answer, failure = await _invoke_with_retries(
+            bound_model, attempts, "tool loop", allow_tool_calls=True, malformed=malformed,
+            recorder=recorder, turn=turn, variants=TOOL_LOOP_PROMPT_VARIANTS)
         update: dict[str, Any] = {"model_turns": turn}
         if failure is None:
             message = answer
@@ -617,18 +680,23 @@ def build_graph(
         for call in calls:
             name, args = call["name"], call["args"]
             from_model = call["id"] not in followup_reasons
+            trigger = None if from_model else (
+                TRIGGER_PRE_RESOLUTION if str(call["id"]).startswith(PRE_RESOLUTION_CALL_PREFIX)
+                else TRIGGER_FOLLOWUP)
             normalized_args = args
             adjustments: list[str] = []
             count = 0
             page = None
             verification = None
             sent = False
+            latency: float | None = None
+            error_kind: str | None = None
             if name not in tool_names:
                 payload = {"error": f"Unknown tool: {name}"}
-                ok = False
+                ok, outcome = False, UNKNOWN_TOOL
             elif not isinstance(args, dict):
                 payload = {"error": "Tool arguments must be an object"}
-                ok = False
+                ok, outcome = False, INVALID_ARGUMENTS
             else:
                 normalized_args, adjustments = prepare_arguments(name, args)
                 dependency = DEPENDENT_IDS.get(name)
@@ -646,7 +714,7 @@ def build_graph(
                             dependency[0], required_id, dependency[1],
                             evidence[dependency[1]], verification == VERIFIED_SAME_BATCH),
                     }
-                    ok = False
+                    ok, outcome = False, UNVERIFIED_ID_REJECTED
                 elif _call_key(name, normalized_args) in succeeded:
                     # Re-running an identical read-only lookup cannot add evidence.
                     payload = {
@@ -654,15 +722,17 @@ def build_graph(
                         "details": "This exact lookup already succeeded; use its earlier "
                                    "result or call a different tool.",
                     }
-                    ok = False
+                    ok, outcome = False, DUPLICATE_REJECTED
                 elif from_model and (complete := _complete_ticket_list(
                         name, normalized_args, evidence, trace)):
                     payload = {"error": REDUNDANT_PAGE_ERROR, "details": complete}
-                    ok = False
+                    ok, outcome = False, REDUNDANT_PAGE_REJECTED
                 else:
                     sent = True
+                    started = recorder.now()
                     try:
                         result = await client.call_tool(name, normalized_args)
+                        latency = recorder.elapsed_ms(started)
                         if result.isError:
                             text = "\n".join(
                                 item.text for item in result.content or []
@@ -672,7 +742,7 @@ def build_graph(
                                 "error": "MCP tool returned an error",
                                 "details": clean_tool_error(name, text),
                             }
-                            ok = False
+                            ok, outcome = False, tool_error_outcome(name, text)
                         else:
                             payload = result.structuredContent
                             if payload is None:
@@ -685,11 +755,20 @@ def build_graph(
                                 page = parse_ticket_page(payload,
                                                          normalized_args.get("account_id"))
                             succeeded.add(_call_key(name, normalized_args))
-                            ok = True
+                            ok, outcome = True, EXECUTED_SUCCESS
+                    except asyncio.CancelledError:
+                        recorder.record_tool(
+                            tool=name, origin="model" if from_model else "orchestrator",
+                            trigger=trigger, outcome=CANCELLED, executed=True,
+                            latency_ms=recorder.elapsed_ms(started))
+                        raise
                     except Exception as exc:
+                        if latency is None:
+                            latency = recorder.elapsed_ms(started)
                         logger.warning("MCP tool %s failed: %s", name, exc)
                         payload = {"error": f"Tool unavailable: {type(exc).__name__}"}
-                        ok = False
+                        ok, outcome = False, EXECUTED_ERROR
+                        error_kind = error_category(exc)
             serialized = json.dumps(payload, ensure_ascii=False, default=str)
             if len(serialized) > MAX_TOOL_RESULT_CHARS:
                 serialized = serialized[:MAX_TOOL_RESULT_CHARS] + " ... [TRUNCATED]"
@@ -704,9 +783,11 @@ def build_graph(
                 "success": ok,
                 "executed": sent,
                 "record_count": count,
+                "outcome": outcome,
             }
             if call["id"] in followup_reasons:
                 entry["reason"] = followup_reasons[call["id"]]
+                entry["trigger"] = trigger
             if page is not None:
                 # Taken from the full payload, so result truncation below cannot affect it.
                 entry["page"] = page
@@ -714,7 +795,14 @@ def build_graph(
                 entry["adjustments"] = adjustments
             if not ok:
                 entry["error"] = _tool_error(payload)
+            if latency is not None:
+                entry["latency_ms"] = latency
+            if error_kind:
+                entry["error_category"] = error_kind
             trace.append(entry)
+            recorder.record_tool(tool=name, origin=entry["origin"], trigger=trigger,
+                                 outcome=outcome, executed=sent, latency_ms=latency,
+                                 error_category=error_kind)
             if from_model:
                 proposals.append(proposal(
                     state, name, normalized_args,
@@ -734,9 +822,12 @@ def build_graph(
                     "origin": "model",
                     "success": False,
                     "executed": False,
+                    "outcome": CALL_LIMIT_REJECTED,
                     "error": "Tool-call limit exceeded",
                 }
             )
+            recorder.record_tool(tool=call["name"], origin="model", trigger=None,
+                                 outcome=CALL_LIMIT_REJECTED, executed=False)
             proposals.append(proposal(state, call["name"], prepared(call), PROPOSAL_REJECTED,
                                       "Tool-call limit exceeded", round_number=round_number))
         return {
@@ -927,6 +1018,7 @@ def build_graph(
         records = _labelled_records(state["question"], state["evidence"], state["tool_trace"])
         plan = plan_evidence(state["question"], state["evidence"], state["tool_trace"])
         if plan.gaps or plan.calls or not records:
+            recorder.synthesis_status = SYNTHESIS_SKIPPED
             return {**done, "messages": [AIMessage(content="")],
                     "answer_source": ANSWER_FROM_EVIDENCE,
                     "answer_notice": ("Required evidence is missing, so no conclusion was "
@@ -938,7 +1030,8 @@ def build_graph(
                             state["question"], state["evidence"], state["tool_trace"])]))]
         # The unbound model: no tool specs are sent, so no tool can be requested.
         reply, failure = await _invoke_with_retries(
-            model, [messages] * MODEL_ATTEMPTS, "synthesis")
+            model, [messages] * MODEL_ATTEMPTS, "synthesis", recorder=recorder)
+        recorder.synthesis_status = SYNTHESIS_COMPLETED if failure is None else SYNTHESIS_FAILED
         if failure is not None:
             return {**done, "messages": [AIMessage(content="")],
                     "answer_source": ANSWER_FROM_EVIDENCE,
@@ -982,12 +1075,14 @@ async def investigate(
     tools: list[Any],
     max_rounds: int = MAX_TOOL_ROUNDS,
     pre_resolve: bool = True,
+    recorder: InvestigationRecorder | None = None,
 ) -> dict[str, Any]:
     if not question.strip() or len(question) > 4000:
         raise ValueError("question must contain 1-4000 non-whitespace characters")
-    graph = build_graph(model, client, tools, max_rounds, pre_resolve)
-    result = await graph.ainvoke(
-        {
+    recorder = recorder if recorder is not None else InvestigationRecorder()
+    graph = build_graph(model, client, tools, max_rounds, pre_resolve, recorder)
+    with recorder.phase("graph"):
+        result = await graph.ainvoke({
             "messages": [HumanMessage(content=question)],
             "question": question,
             "tool_rounds": 0,
@@ -1003,8 +1098,8 @@ async def investigate(
             "model_turns": 0,
             "model_proposals": [],
             "model_turn_log": [],
-        }
-    )
+        })
+    recorder.proposals = result["model_proposals"]
     evidence = result["evidence"]
     records = _labelled_records(question, evidence, result["tool_trace"])
     coverage = ticket_coverage_report(question, evidence, result["tool_trace"])
@@ -1058,6 +1153,7 @@ async def investigate(
         "model_proposals": result["model_proposals"],
         "model_turns": result["model_turns"],
         "model_turn_log": result["model_turn_log"],
+        "metrics": recorder.safe_snapshot(),
     }
 
 

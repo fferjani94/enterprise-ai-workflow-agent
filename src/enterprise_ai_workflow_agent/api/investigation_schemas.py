@@ -4,6 +4,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from enterprise_ai_workflow_agent.core.config import MAX_ALLOWED_ROUNDS, MAX_QUESTION_LENGTH
 
+ToolOutcome = Literal[
+    "executed_success", "executed_error", "invalid_arguments", "unknown_tool",
+    "unverified_id_rejected", "duplicate_rejected", "redundant_page_rejected",
+    "call_limit_rejected",
+]
+ErrorCategory = Literal["timeout", "connection", "transient", "other"]
+
 
 class InvestigationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -38,6 +45,17 @@ class ToolTraceEntry(BaseModel):
         "calls rejected or skipped before execution.")
     record_count: int = 0
     error: str | None = None
+    outcome: ToolOutcome | None = Field(
+        default=None, description="What happened to the call. 'executed_*' calls reached the "
+        "MCP tool; '*_rejected', 'unknown_tool' and unexecuted 'invalid_arguments' were "
+        "skipped before execution. Independent of origin. Absent in older results.")
+    trigger: Literal["pre_resolution", "followup"] | None = Field(
+        default=None, description="For orchestrator calls: searches for named accounts before "
+        "the first model turn, or follow-ups for missing evidence.")
+    latency_ms: float | None = Field(
+        default=None, description="MCP round-trip time, for executed calls only.")
+    error_category: ErrorCategory | None = Field(
+        default=None, description="Kind of failure when the tool call raised.")
 
 
 class ModelProposalEntry(BaseModel):
@@ -107,6 +125,125 @@ class InvestigationAnalysis(BaseModel):
         default_factory=list, description="What the records do not establish.")
 
 
+class PhaseTimings(BaseModel):
+    """Milliseconds; None when the phase was not measured or not reached.
+
+    Stage timings include retries and the elapsed time of calls cancelled in flight.
+    """
+
+    total: float | None = Field(default=None, description="Service time, queue wait included.")
+    queue_wait: float | None = None
+    preflight: float | None = None
+    mcp_startup: float | None = Field(
+        default=None, description="Includes a startup that failed or was cancelled.")
+    graph: float | None = None
+    llm_tool_loop: float | None = None
+    llm_synthesis: float | None = None
+    tool_execution: float | None = Field(
+        default=None, description="All MCP calls, including any cancelled in flight.")
+    orchestration_overhead: float | None = Field(
+        default=None, description="Graph time spent outside model and tool calls.")
+
+
+class LlmMetrics(BaseModel):
+    calls: int = Field(default=0, description="Logical model calls; retries excluded.")
+    attempts: int = 0
+    retries: int = 0
+    ok_attempts: int = 0
+    error_attempts: int = Field(default=0, description="Non-retryable model failures.")
+    transient_error_attempts: int = Field(
+        default=0, description="Retryable provider errors.")
+    empty_attempts: int = Field(
+        default=0, description="Replies with no text or tool call; retried, not failures.")
+    cancelled_attempts: int = Field(
+        default=0, description="In flight when the investigation was cancelled.")
+
+
+class TokenCounts(BaseModel):
+    """Provider-reported tokens summed over attempts; None when never reported.
+
+    Failed and empty attempts are included. The conversation is re-sent every turn, so
+    input tokens count processed prompt tokens.
+    """
+
+    input: int | None = None
+    output: int | None = None
+    total: int | None = Field(
+        default=None, description="Reported totals, else input + output per attempt.")
+    reported_attempts: int = 0
+    unreported_attempts: int = Field(
+        default=0, description="Attempts that produced a reply without usage data.")
+
+
+class TokenUsage(TokenCounts):
+    by_stage: dict[Literal["tool_loop", "synthesis"], TokenCounts] = Field(
+        default_factory=dict, description="The same counts per model stage.")
+
+
+class LlmAttemptMetrics(BaseModel):
+    stage: Literal["tool_loop", "synthesis"]
+    call: int = Field(description="Logical model call; retries share the number.")
+    turn: int | None = None
+    attempt: int
+    prompt_variant: Literal["with_system", "without_system"] | None = None
+    outcome: Literal["ok", "empty", "transient_error", "error", "cancelled"]
+    error_category: ErrorCategory | None = None
+    latency_ms: float
+    tool_calls: int = 0
+    invalid_tool_calls: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    provider_load_ms: float | None = None
+    provider_prompt_eval_ms: float | None = None
+    provider_eval_ms: float | None = None
+    provider_total_ms: float | None = None
+    done_reason: Literal["stop", "length", "load", "unknown"] | None = None
+
+
+class SynthesisMetrics(BaseModel):
+    status: Literal["completed", "failed", "skipped", "cancelled", "not_reached"] = \
+        "not_reached"
+    latency_ms: float | None = None
+    attempts: int = 0
+
+
+class LatencyStats(BaseModel):
+    count: int = 0
+    total_ms: float = 0.0
+    max_ms: float | None = None
+    mean_ms: float | None = None
+
+
+class ToolMetrics(BaseModel):
+    trace_entries: int = Field(default=0, description="Equals the response's tool_calls.")
+    executed: int = Field(default=0, description="Completed MCP calls; cancelled excluded.")
+    cancelled: int = Field(
+        default=0, description="MCP calls in flight when the investigation was cancelled.")
+    by_outcome: dict[str, int] = Field(default_factory=dict)
+    by_origin: dict[str, int] = Field(default_factory=dict)
+    by_trigger: dict[str, int] = Field(default_factory=dict)
+    rejected_proposals: int | None = None
+    superseded_proposals: int | None = None
+    latency: LatencyStats = Field(
+        default_factory=LatencyStats, description="Completed MCP calls only.")
+    latency_by_tool: dict[str, LatencyStats] = Field(default_factory=dict)
+
+
+class InvestigationMetrics(BaseModel):
+    """Diagnostics: timings, token usage and tool outcomes. No prompts or tool data."""
+
+    schema_version: Literal[1] = 1
+    partial: bool = Field(
+        default=False, description="Collected from an investigation that did not finish.")
+    timings_ms: PhaseTimings = Field(default_factory=PhaseTimings)
+    llm: LlmMetrics = Field(default_factory=LlmMetrics)
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    llm_attempts: list[LlmAttemptMetrics] = Field(default_factory=list)
+    synthesis: SynthesisMetrics = Field(default_factory=SynthesisMetrics)
+    tools: ToolMetrics = Field(default_factory=ToolMetrics)
+
+
 class InvestigationResponse(BaseModel):
     id: str
     question: str
@@ -147,6 +284,8 @@ class InvestigationResponse(BaseModel):
         default_factory=list, description="Diagnostics: one entry per tool-loop model turn.")
     evidence: list[EvidenceRecord]
     analysis: InvestigationAnalysis = Field(default_factory=InvestigationAnalysis)
+    metrics: InvestigationMetrics | None = Field(
+        default=None, description="Diagnostics: timings, token usage and tool outcomes.")
 
 
 class ErrorDetail(BaseModel):
@@ -161,6 +300,8 @@ class InvestigationErrorResponse(BaseModel):
     status: Literal["failed"] = "failed"
     error: ErrorDetail
     duration_seconds: float = 0.0
+    metrics: InvestigationMetrics | None = Field(
+        default=None, description="Partial diagnostics for timeouts and model failures.")
 
 
 class InvestigationConfig(BaseModel):
